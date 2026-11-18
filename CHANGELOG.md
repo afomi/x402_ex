@@ -11,6 +11,7 @@ Before 1.0, a minor version may change the API; each change is listed here.
 - CI also checks the lockfile (`mix deps.get --check-locked`), builds the docs with warnings as errors and builds the Hex package; `CONTRIBUTING.md` ships in the package.
 - `docs/SPEC_NOTES.md` re-read against the x402 Foundation repository: standard base64 only and strict `value == amount` are confirmed from the reference code, and the reference server's retry of `settlement_pending` is noted.
 - README: browser clients need `PAYMENT-RESPONSE` in `Access-Control-Expose-Headers`; a reconciler run that overlaps a request's Stripe call gets a 409 and finishes next time.
+- CI tests Elixir 1.19 only, and the minimum is Elixir 1.18 (was 1.15), the oldest version in use.
 
 ## v0.1.0 (2026-11-18)
 
