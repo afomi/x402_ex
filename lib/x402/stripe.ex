@@ -25,18 +25,30 @@ defmodule X402.Stripe do
   (`:amount_not_whole_cents`), so Stripe never records a sum the payer did
   not pay. Only USDC on Base and Base Sepolia is accepted (`:unsupported_asset`).
 
-  The secret key is used for the `Authorization` header and nowhere else: it
-  is never logged and never part of a return value. Stripe's error messages
-  are not returned either (they can echo part of a key); only the HTTP
-  status and Stripe's `type` and `code`.
+  Keys and networks: a live key (`sk_live_`, `rk_live_`) is refused for Base
+  Sepolia, and a test key (`sk_test_`, `rk_test_`) for Base mainnet
+  (`:key_network_mismatch`), so testnet USDC is never recorded as live revenue.
+
+  The secret key may be a string or a 0-arity function returning one; a
+  function keeps it out of any argument list a crash report could print. It
+  is used for the `Authorization` header and nowhere else: never logged and
+  never part of a return value. Stripe's error messages are not returned
+  either (they can echo part of a key); only the HTTP status and Stripe's
+  `type` and `code`.
+
+  The idempotency key is the transaction hash, so retrying a record (as
+  `X402.Reconciler` does) returns the same PaymentIntent. Stripe keeps
+  idempotency keys for 24 hours.
 
   Options: `:stripe_version`, `:stripe_network` (overrides the network
-  mapping), `:receive_timeout` (default 10,000 ms), `:req_options`.
+  mapping), `:receive_timeout` (default 10,000 ms, also the deadline for the
+  whole response), `:connect_timeout` (default 2,000 ms), `:req_options`
+  (test seam, see `X402.HTTPClient`).
   """
 
   require Logger
 
-  alias X402.{Offer, Settlement}
+  alias X402.{HTTPClient, Offer, Settlement}
   alias X402.Scheme.ExactEvm
 
   @url "https://api.stripe.com/v1/payment_intents"
@@ -45,15 +57,20 @@ defmodule X402.Stripe do
   @code ~r/\A[a-z0-9_]{1,64}\z/
 
   # Stripe's crypto network name for each CAIP-2 network. Base Sepolia maps
-  # to "base" too: Stripe's sandbox guide creates its deposit address with
-  # network=base. UNCONFIRMED for transaction_verification_options.network.
+  # to "base" too: Stripe's sandbox guide changes the deposit address and
+  # the facilitator, not the PaymentIntent's network.
   @networks %{"eip155:8453" => "base", "eip155:84532" => "base"}
+  @mainnets ["eip155:8453"]
+  @testnets ["eip155:84532"]
 
   @doc "The default `Stripe-Version`."
   def default_version, do: @default_version
 
+  @type secret :: String.t() | (-> String.t())
+
   @type error ::
           :invalid_secret_key
+          | :key_network_mismatch
           | :invalid_transaction
           | :unsupported_network
           | :unsupported_asset
@@ -61,27 +78,50 @@ defmodule X402.Stripe do
           | :timeout
           | :stripe_unavailable
           | :invalid_response
+          | :req_options_not_allowed
           | {:stripe_error, non_neg_integer(), String.t() | nil, String.t() | nil}
 
   @doc """
   Creates the PaymentIntent for a settlement. Returns `{:ok, "pi_..."}`.
 
-      X402.Stripe.record(secret_key, %{settlement: settlement, offer: offer})
+  Its second argument is what `X402.handle/2` gives `:on_settled`, so
+
+      on_settled: &X402.Stripe.record(fn -> stripe_key() end, &1)
+
+  records each payment, and `X402.handle/2` stores the returned id.
   """
-  @spec record(String.t(), %{settlement: Settlement.t(), offer: Offer.t()}, keyword()) ::
+  @spec record(
+          secret(),
+          %{required(:settlement) => Settlement.t(), required(:offer) => Offer.t()},
+          keyword()
+        ) ::
           {:ok, String.t()} | {:error, error()}
-  def record(secret_key, %{settlement: %Settlement{} = s, offer: %Offer{} = offer}, opts \\ []) do
-    with :ok <- secret_key(secret_key),
-         :ok <-
-           if(ExactEvm.valid_transaction?(s.transaction),
-             do: :ok,
-             else: {:error, :invalid_transaction}
-           ),
-         {:ok, network} <- network(offer, opts),
-         :ok <- asset(offer),
-         {:ok, cents} <- cents(offer.amount) do
-      body = form(cents, network, s.transaction)
-      post(secret_key, body, s.transaction, opts)
+  def record(secret, %{settlement: %Settlement{} = s, offer: %Offer{} = offer}, opts \\ []) do
+    record_payment(
+      secret,
+      %{tx_hash: s.transaction, network: offer.network, asset: offer.asset, amount: offer.amount},
+      opts
+    )
+  end
+
+  @doc """
+  Creates the PaymentIntent from the stored facts of a payment:
+  `%{tx_hash, network, asset, amount}`. Used by `X402.Reconciler`.
+  """
+  @spec record_payment(secret(), map(), keyword()) :: {:ok, String.t()} | {:error, error()}
+  def record_payment(
+        secret,
+        %{tx_hash: tx, network: network, asset: asset, amount: amount},
+        opts \\ []
+      ) do
+    with {:ok, key} <- secret_key(secret),
+         :ok <- key_matches_network(key, network),
+         :ok <- if(ExactEvm.valid_transaction?(tx), do: :ok, else: {:error, :invalid_transaction}),
+         {:ok, stripe_network} <- stripe_network(network, opts),
+         :ok <- asset(network, asset),
+         {:ok, cents} <- cents(amount) do
+      tx = String.downcase(tx)
+      post(key, form(cents, stripe_network, tx), tx, opts)
     end
   end
 
@@ -102,27 +142,28 @@ defmodule X402.Stripe do
     ]
   end
 
-  defp post(secret_key, body, tx_hash, opts) do
-    req =
-      Req.new(
-        method: :post,
-        url: @url,
-        headers: [
-          {"authorization", "Bearer " <> secret_key},
-          {"stripe-version", Keyword.get(opts, :stripe_version, @default_version)},
-          {"idempotency-key", tx_hash},
-          {"content-type", "application/x-www-form-urlencoded"}
-        ],
-        body: URI.encode_query(body, :www_form),
-        retry: false,
-        redirect: false,
-        decode_body: false,
-        receive_timeout: Keyword.get(opts, :receive_timeout, 10_000)
-      )
-      |> Req.merge(Keyword.get(opts, :req_options, []))
+  defp post(key, body, tx_hash, opts) do
+    timeout = Keyword.get(opts, :receive_timeout, 10_000)
 
-    case Req.request(req) do
-      {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
+    req = [
+      method: :post,
+      url: @url,
+      headers: [
+        {"authorization", "Bearer " <> key},
+        {"stripe-version", Keyword.get(opts, :stripe_version, @default_version)},
+        {"idempotency-key", tx_hash},
+        {"content-type", "application/x-www-form-urlencoded"}
+      ],
+      body: URI.encode_query(body, :www_form),
+      connect_options: [timeout: Keyword.get(opts, :connect_timeout, 2_000)],
+      receive_timeout: timeout
+    ]
+
+    case HTTPClient.request(req,
+           deadline_ms: timeout,
+           req_options: Keyword.get(opts, :req_options, [])
+         ) do
+      {:ok, status, body} when status in 200..299 ->
         case Jason.decode(body) do
           {:ok, %{"id" => "pi_" <> _ = id}} ->
             Logger.info("x402 stripe recorded payment_intent=#{id} tx_hash=#{tx_hash}")
@@ -132,7 +173,7 @@ defmodule X402.Stripe do
             {:error, :invalid_response}
         end
 
-      {:ok, %Req.Response{status: status, body: body}} ->
+      {:ok, status, body} ->
         {type, code} = stripe_error(body)
 
         Logger.warning(
@@ -141,10 +182,16 @@ defmodule X402.Stripe do
 
         {:error, {:stripe_error, status, type, code}}
 
-      {:error, %Req.TransportError{reason: :timeout}} ->
+      {:error, :timeout} ->
         {:error, :timeout}
 
-      {:error, _exception} ->
+      {:error, :too_large} ->
+        {:error, :invalid_response}
+
+      {:error, :req_options_not_allowed} ->
+        {:error, :req_options_not_allowed}
+
+      {:error, _} ->
         {:error, :stripe_unavailable}
     end
   end
@@ -159,21 +206,33 @@ defmodule X402.Stripe do
   defp safe(s) when is_binary(s), do: if(s =~ @code, do: s, else: nil)
   defp safe(_), do: nil
 
-  defp secret_key("sk_" <> rest) when byte_size(rest) > 0, do: :ok
-  defp secret_key("rk_" <> rest) when byte_size(rest) > 0, do: :ok
+  defp secret_key(fun) when is_function(fun, 0), do: secret_key(fun.())
+  defp secret_key("sk_" <> rest = key) when byte_size(rest) > 0, do: {:ok, key}
+  defp secret_key("rk_" <> rest = key) when byte_size(rest) > 0, do: {:ok, key}
   defp secret_key(_), do: {:error, :invalid_secret_key}
 
-  defp network(offer, opts) do
-    case Keyword.get(opts, :stripe_network) || Map.get(@networks, offer.network) do
-      nil -> {:error, :unsupported_network}
-      network -> {:ok, network}
+  defp key_matches_network(key, network) do
+    live? = String.starts_with?(key, ["sk_live_", "rk_live_"])
+    test? = String.starts_with?(key, ["sk_test_", "rk_test_"])
+
+    cond do
+      live? and network in @testnets -> {:error, :key_network_mismatch}
+      test? and network in @mainnets -> {:error, :key_network_mismatch}
+      true -> :ok
     end
   end
 
-  defp asset(offer) do
-    case ExactEvm.usdc(offer.network) do
+  defp stripe_network(network, opts) do
+    case Keyword.get(opts, :stripe_network) || Map.get(@networks, network) do
+      nil -> {:error, :unsupported_network}
+      stripe_network -> {:ok, stripe_network}
+    end
+  end
+
+  defp asset(network, asset) do
+    case ExactEvm.usdc(network) do
       {:ok, %{asset: usdc}} ->
-        if ExactEvm.same_address?(usdc, offer.asset), do: :ok, else: {:error, :unsupported_asset}
+        if ExactEvm.same_address?(usdc, asset), do: :ok, else: {:error, :unsupported_asset}
 
       :error ->
         {:error, :unsupported_asset}

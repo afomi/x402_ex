@@ -42,7 +42,8 @@ defmodule X402.Offer do
     :description,
     :mime_type,
     :max_timeout_seconds,
-    extra: %{}
+    extra: %{},
+    allow_unknown_asset: false
   ]
 
   @type t :: %__MODULE__{
@@ -55,7 +56,8 @@ defmodule X402.Offer do
           description: String.t() | nil,
           mime_type: String.t() | nil,
           max_timeout_seconds: pos_integer(),
-          extra: %{optional(String.t()) => term()}
+          extra: %{optional(String.t()) => term()},
+          allow_unknown_asset: boolean()
         }
 
   @doc "The protocol version this library speaks."
@@ -66,7 +68,13 @@ defmodule X402.Offer do
 
   Takes a map (atom keys) with `:amount`, `:asset`, `:network`, `:pay_to`,
   `:resource`, `:max_timeout_seconds`, and optionally `:description`,
-  `:mime_type`, `:extra` (string keys) and `:scheme` (default `"exact"`).
+  `:mime_type`, `:extra` (string keys), `:scheme` (default `"exact"`) and
+  `:allow_unknown_asset` (default `false`).
+
+  On a network whose USDC the scheme knows (Base, Base Sepolia), `:asset` and
+  `:extra` must be that USDC's contract and EIP-712 domain, so a copied
+  config cannot pair a mainnet offer with a testnet token. Set
+  `allow_unknown_asset: true` to offer another token there.
 
   `:amount` is a positive integer or a string of decimal digits, in the
   asset's atomic units (USDC has 6 decimals: 10_000 is $0.01).
@@ -82,7 +90,8 @@ defmodule X402.Offer do
          {:ok, timeout} <- timeout(Map.get(attrs, :max_timeout_seconds)),
          {:ok, description} <- optional_string(attrs, :description),
          {:ok, mime_type} <- optional_string(attrs, :mime_type),
-         {:ok, extra} <- extra(Map.get(attrs, :extra, %{})) do
+         {:ok, extra} <- extra(Map.get(attrs, :extra, %{})),
+         {:ok, allow_unknown} <- boolean(Map.get(attrs, :allow_unknown_asset, false)) do
       offer = %__MODULE__{
         scheme: scheme,
         network: network,
@@ -93,7 +102,8 @@ defmodule X402.Offer do
         description: description,
         mime_type: mime_type,
         max_timeout_seconds: timeout,
-        extra: extra
+        extra: extra,
+        allow_unknown_asset: allow_unknown
       }
 
       with {:ok, module} <- Scheme.for(scheme, network),
@@ -194,6 +204,9 @@ defmodule X402.Offer do
 
   defp timeout(n) when is_integer(n) and n > 0, do: {:ok, n}
   defp timeout(_), do: {:error, :invalid_max_timeout_seconds}
+
+  defp boolean(b) when is_boolean(b), do: {:ok, b}
+  defp boolean(_), do: {:error, :invalid_allow_unknown_asset}
 
   defp extra(map) when is_map(map) do
     if Enum.all?(Map.keys(map), &is_binary/1), do: {:ok, map}, else: {:error, :invalid_extra}

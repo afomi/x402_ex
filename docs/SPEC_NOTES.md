@@ -150,7 +150,10 @@ The parameter is `allowed_payment_method_types`, not `payment_method_types`: tha
 
 `Stripe-Version`: we default to `2026-05-27.preview`, which `STRIPE_X402` requires ("This feature requires the `2026-05-27.preview` API version").
 The sources disagree: the sample sets `2026-10-28.preview` (`SAMPLE_TS` `apiVersion`, `SAMPLE_PY` `stripe.api_version`), and the docs' sandbox section creates its deposit address with `2026-07-29.preview`.
-**UNCONFIRMED** which one Stripe expects today; pass `stripe_version:` to choose.
+The sandbox version is for deposit-address creation, not this call.
+The sample's version is its Stripe client's, so the sample does send `2026-10-28.preview` on its PaymentIntent create.
+The docs name `2026-05-27.preview` for this call explicitly, so that stays the default (the jurisdictional review of v0.1 agreed).
+**UNCONFIRMED** whether Stripe also accepts the newer preview for it; pass `stripe_version:` to choose.
 
 Amount: "requirements.amount is in atomic USDC units (6 decimals). $0.01 = 10000 atomic units. Convert to cents for Stripe." (`SAMPLE_TS`).
 The sample rounds and skips under one cent; we refuse anything that is not a whole number of cents.

@@ -5,9 +5,10 @@ defmodule X402 do
 
       case X402.handle(conn,
              offer: offer,
+             scope: [app: "bitblocks", pay_to: deposit_address],
              facilitator: {X402.Facilitator.X402Org, []},
              replay_guard: {MyApp.X402Claims, []},
-             on_settled: &X402.Stripe.record(stripe_key, &1)
+             on_settled: &X402.Stripe.record(fn -> stripe_key() end, &1)
            ) do
         {:ok, conn, _settlement} ->
           serve(conn)
@@ -22,6 +23,9 @@ defmodule X402 do
           send_resp(conn, 503, "")
       end
 
+  Rate-limit the paid path per client before calling `handle/2`: every
+  well-formed header costs a facilitator `/verify` call.
+
   ## The steps
 
   With no `PAYMENT-SIGNATURE` header: `{:payment_required, challenge}`, where
@@ -34,9 +38,15 @@ defmodule X402 do
     3. verify it with the facilitator (`/verify`, read-only);
     4. claim its authorization in the replay guard (`"auth:" <> payment_id`);
     5. settle it with the facilitator (`/settle`, moves the money);
-    6. claim the settlement's transaction (`"tx:" <> network <> ":" <> hash`);
-    7. call `on_settled` (for example, record it in Stripe);
+    6. claim the settlement's transaction (`"tx:" <> network <> ":" <> hash`),
+       the durable record, before anything else can fail;
+    7. call `on_settled` (for example, record it in Stripe), and store the
+       PaymentIntent id it returns on the `"tx:"` row;
     8. return `{:ok, conn, settlement}`, `conn` carrying `PAYMENT-RESPONSE`.
+
+  Steps 5 to 7 run in a process under `X402.TaskSupervisor`, not linked to
+  the request, which waits for it. A client that disconnects mid-settle
+  kills its request process; the settlement and its record still complete.
 
   ## Why claim before settle
 
@@ -63,13 +73,38 @@ defmodule X402 do
   settle before the app runs the resource, not after, so the app knows it has
   been paid before it does the work.
 
+  ## One deposit address per app
+
+  The exactly-once boundary is one guard table. Two apps with separate tables
+  that share a `payTo` could each claim and serve one authorization, if a
+  facilitator answered a repeated settle with the original hash. So each app
+  must use its own deposit address, and `:scope` makes that explicit: it
+  names the app and its one deposit address, and `handle/2` raises
+  `ArgumentError` for an offer paying anyone else. The claim rows carry the
+  app name.
+
+  ## After the money moves
+
+  Once `/settle` succeeds, no failure leaves the payment unrecorded or
+  unserved:
+
+    * a guard error on the `"tx:"` claim (not `:replayed`) still serves the
+      client, and logs `outcome=tx_claim_failed` with the hash at error level;
+    * an `on_settled` that returns an error, raises, throws or exits is
+      logged; the client, who has paid, still gets `{:ok, ...}`, and the row
+      stays without a PaymentIntent for `X402.Reconciler` to record.
+
+  Before it succeeds, a facilitator adapter that raises, throws or exits is
+  treated as the facilitator being unavailable, and fails closed.
+
   ## Failing closed
 
   Claims are never released. If settlement fails, times out or comes back
   `settlement_pending`, the authorization stays claimed and the client must
   sign a new one; the same header is refused as `:replayed`. A timeout during
   settle may still have moved money: such a case is logged with the payer,
-  and a pending one with the transaction hash, for the app to reconcile.
+  and a pending one with the transaction hash, for the app to reconcile
+  (`X402.Reconciler`, "What it does not cover").
 
   Results:
 
@@ -85,28 +120,37 @@ defmodule X402 do
       The spec answers a malformed payload with 400 (transports-v2/http.md,
       "Error Handling"); an app may do so for the decode reasons.
     * `{:error, :facilitator_unavailable}` when the facilitator could not be
-      reached, timed out, answered non-2xx without a verdict, or answered
-      something we could not parse. Answer 503 (or 402) with no content.
-    * `{:error, :replay_guard_unavailable}` when the guard returned anything
-      but `:ok` or `{:error, :replayed}`. Same answer.
-
-  `on_settled` runs after the payment is final. Its result does not change
-  the outcome: an `{:error, _}` or a raise is logged, and the client, who has
-  paid, still gets `{:ok, ...}`.
+      reached, timed out, answered non-2xx without a verdict, answered
+      something we could not parse or that contradicts the signed payment
+      (another payer or amount), or its adapter crashed. Answer 503 (or 402)
+      with no content.
+    * `{:error, :replay_guard_unavailable}` when the guard could not make the
+      `"auth:"` claim. Same answer.
 
   ## Logging
 
   Only the outcome, the payer address and the transaction hash are logged;
-  never a header, a signature or a key.
+  never a header, a signature or a key. Decode refusals log at debug level,
+  since crawlers send many.
   """
 
   require Logger
 
-  alias X402.{Facilitator, Offer, Payment, Settlement}
+  alias X402.{Facilitator, Offer, Payment, Safe, Scheme, Settlement}
 
   @payment_header "payment-signature"
   @challenge_header "payment-required"
   @response_header "payment-response"
+
+  @decode_reasons [
+    :header_too_large,
+    :invalid_base64,
+    :invalid_json,
+    :not_an_object,
+    :unsupported_version,
+    :invalid_payload,
+    :multiple_payment_headers
+  ]
 
   @doc "The request header carrying the client's payment (`PAYMENT-SIGNATURE`), lowercased for Plug."
   def payment_header, do: @payment_header
@@ -134,47 +178,108 @@ defmodule X402 do
   Options:
 
     * `:offer` (required): an `X402.Offer`.
+    * `:scope` (required): `[app: name, pay_to: deposit_address]`, this app
+      and its one deposit address. An offer to any other address raises.
     * `:facilitator` (required): `{module, config}`, a `X402.Facilitator`.
     * `:replay_guard` (required): `{module, config}`, a `X402.ReplayGuard`.
     * `:on_settled`: a 1-arity function given
-      `%{settlement: settlement, offer: offer, payer: payer}`.
+      `%{settlement: settlement, offer: offer, payer: payer}`. If it returns
+      `{:ok, "pi_..."}`, the id is stored on the `"tx:"` row.
     * `:max_header_bytes`: the cap on the payment header (default 8,192).
+    * `:settle_await_ms`: how long the request waits for settle and record
+      (default 40,000). Past it the request gets
+      `{:error, :facilitator_unavailable}` and the work carries on.
+
+  A missing or invalid option raises `ArgumentError` naming the option, and
+  never its value (a facilitator config may hold a secret).
   """
   @spec handle(Plug.Conn.t(), keyword()) :: result()
-  def handle(%Plug.Conn{} = conn, opts) do
-    %Offer{} = offer = Keyword.fetch!(opts, :offer)
-    {_, _} = facilitator = Keyword.fetch!(opts, :facilitator)
-    {_, _} = guard = Keyword.fetch!(opts, :replay_guard)
+  def handle(%Plug.Conn{} = conn, opts) when is_list(opts) do
+    offer = option!(opts, :offer, &match?(%Offer{}, &1))
+    facilitator = option!(opts, :facilitator, &adapter?/1)
+    guard = option!(opts, :replay_guard, &adapter?/1)
+    app = check_scope!(option!(opts, :scope, &Keyword.keyword?/1), offer)
+
+    ctx = %{
+      offer: offer,
+      app: app,
+      facilitator: facilitator,
+      guard: guard,
+      on_settled: option(opts, :on_settled, &is_function(&1, 1)),
+      max_bytes: option(opts, :max_header_bytes, &(is_integer(&1) and &1 > 0)),
+      await_ms: option(opts, :settle_await_ms, &(is_integer(&1) and &1 > 0)) || 40_000
+    }
 
     case Plug.Conn.get_req_header(conn, @payment_header) do
       [] ->
         {:payment_required, Offer.challenge_header(offer, "PAYMENT-SIGNATURE header is required")}
 
       [header] ->
-        pay(conn, header, offer, facilitator, guard, opts)
+        pay(conn, header, ctx)
 
       [_, _ | _] ->
         refuse(offer, :multiple_payment_headers, nil)
     end
   end
 
-  defp pay(conn, header, offer, facilitator, guard, opts) do
-    decode_opts = Keyword.take(opts, [:max_header_bytes]) |> rename(:max_header_bytes, :max_bytes)
+  defp option!(opts, key, valid?) do
+    case Keyword.fetch(opts, key) do
+      {:ok, value} ->
+        if valid?.(value),
+          do: value,
+          else: raise(ArgumentError, "X402.handle/2: invalid #{inspect(key)}")
 
-    with {:ok, payment} <- step(Payment.decode(header, decode_opts), offer, nil),
-         {:ok, payment} <- step(Payment.match(payment, offer), offer, nil),
-         request = Facilitator.request(payment, offer),
-         :ok <- verify(facilitator, request, offer, payment),
-         :ok <-
-           claim(
-             guard,
-             "auth:" <> payment.payment_id,
-             meta(:authorization, payment, offer),
-             offer
-           ),
-         {:ok, settlement} <- settle(facilitator, request, offer, payment),
-         :ok <- claim_tx(guard, settlement, payment, offer) do
-      settled(settlement, payment, offer, opts)
+      :error ->
+        raise ArgumentError, "X402.handle/2: missing #{inspect(key)}"
+    end
+  end
+
+  defp option(opts, key, valid?) do
+    case Keyword.fetch(opts, key) do
+      {:ok, nil} ->
+        nil
+
+      {:ok, value} ->
+        if valid?.(value),
+          do: value,
+          else: raise(ArgumentError, "X402.handle/2: invalid #{inspect(key)}")
+
+      :error ->
+        nil
+    end
+  end
+
+  defp adapter?({module, _config}) when is_atom(module), do: true
+  defp adapter?(_), do: false
+
+  defp check_scope!(scope, offer) do
+    app = Keyword.get(scope, :app)
+    pay_to = Keyword.get(scope, :pay_to)
+
+    unless is_binary(app) and app != "" and is_binary(pay_to) do
+      raise ArgumentError, "X402.handle/2: :scope needs :app and :pay_to"
+    end
+
+    {:ok, scheme} = Scheme.for(offer.scheme, offer.network)
+
+    unless scheme.same_address?(offer.pay_to, pay_to) do
+      raise ArgumentError,
+            "X402.handle/2: the offer's pay_to is not the deposit address of app #{inspect(app)}"
+    end
+
+    app
+  end
+
+  defp pay(conn, header, ctx) do
+    decode_opts = if ctx.max_bytes, do: [max_bytes: ctx.max_bytes], else: []
+
+    with {:ok, payment} <- step(Payment.decode(header, decode_opts), ctx.offer),
+         {:ok, payment} <- step(Payment.match(payment, ctx.offer), ctx.offer),
+         request = Facilitator.request(payment, ctx.offer),
+         :ok <- verify(ctx, request, payment),
+         auth_key = "auth:" <> payment.payment_id,
+         :ok <- claim_auth(ctx, auth_key, payment),
+         {:ok, settlement} <- settle_and_record(ctx, request, payment, auth_key) do
       Logger.info(log("paid", payment.payer, settlement.transaction))
 
       {:ok,
@@ -183,121 +288,232 @@ defmodule X402 do
     end
   end
 
-  defp step({:ok, _} = ok, _offer, _payer), do: ok
-  defp step({:error, reason}, offer, payer), do: refuse(offer, reason, payer)
+  defp step({:ok, _} = ok, _offer), do: ok
+  defp step({:error, reason}, offer), do: refuse(offer, reason, nil)
 
-  defp verify({module, config}, request, offer, payment) do
-    case module.verify(request, config) do
-      {:ok, _} ->
-        :ok
+  defp verify(%{facilitator: {module, config}} = ctx, request, payment) do
+    case Safe.call(fn -> module.verify(request, config) end) do
+      {:ok, {:ok, %{payer: payer}}} ->
+        if is_nil(payer) or same_payer?(ctx.offer, payer, payment.payer) do
+          :ok
+        else
+          Logger.error(log("verify_inconsistent", payment.payer, nil) <> " reason=payer_mismatch")
+          {:error, :facilitator_unavailable}
+        end
 
-      {:error, {:rejected, why}} ->
+      {:ok, {:error, {:rejected, why}}} ->
         Logger.info(log("verification_failed", payment.payer, nil) <> " reason=#{code(why)}")
-        refuse(offer, :verification_failed, :logged)
+        refuse(ctx.offer, :verification_failed, :logged)
 
-      {:error, why} ->
-        unavailable("verify", why, payment)
+      {:ok, {:error, why}} ->
+        unavailable("verify", short(why), payment)
+
+      {:ok, _other} ->
+        unavailable("verify", "unexpected_return", payment)
+
+      {:caught, kind} ->
+        unavailable("verify", "adapter_#{kind}", payment)
     end
   end
 
-  defp settle({module, config}, request, offer, payment) do
-    case module.settle(request, config) do
-      {:ok, %Settlement{} = s} ->
-        {:ok, %{s | payer: s.payer || payment.payer, payment_id: payment.payment_id}}
+  defp claim_auth(%{guard: {module, config}} = ctx, key, payment) do
+    meta = meta(ctx, :authorization, payment)
 
-      {:error, {:rejected, why}} ->
-        Logger.warning(log("settlement_failed", payment.payer, nil) <> " reason=#{code(why)}")
-        refuse(offer, :settlement_failed, :logged)
+    case Safe.call(fn -> module.claim(key, meta, config) end) do
+      {:ok, :ok} ->
+        :ok
 
-      {:error, {:pending, tx}} ->
-        Logger.error(log("settlement_pending", payment.payer, code(tx)) <> " reconcile=on_chain")
-        refuse(offer, :settlement_pending, :logged)
+      {:ok, {:error, :replayed}} ->
+        Logger.info(log("replayed", payment.payer, nil))
+        refuse(ctx.offer, :replayed, :logged)
 
-      {:error, why} ->
+      _other ->
+        Logger.error(log("replay_guard_unavailable", payment.payer, nil))
+        {:error, :replay_guard_unavailable}
+    end
+  end
+
+  # Settle, record and call on_settled in a process that outlives the
+  # request, and wait for it.
+  defp settle_and_record(ctx, request, payment, auth_key) do
+    task =
+      Task.Supervisor.async_nolink(X402.TaskSupervisor, fn ->
+        settle(ctx, request, payment, auth_key)
+      end)
+
+    case Task.yield(task, ctx.await_ms) do
+      {:ok, result} ->
+        result
+
+      {:exit, _reason} ->
         Logger.error(
-          log("settle_unavailable", payment.payer, nil) <>
-            " reason=#{short(why)} reconcile=check_payer_on_chain"
+          log("settle_crashed", payment.payer, nil) <> " reconcile=check_payer_on_chain"
+        )
+
+        {:error, :facilitator_unavailable}
+
+      nil ->
+        Process.demonitor(task.ref, [:flush])
+
+        Logger.error(
+          log("settle_still_running", payment.payer, nil) <> " reconcile=check_payer_on_chain"
         )
 
         {:error, :facilitator_unavailable}
     end
   end
 
-  defp claim({module, config}, key, meta, offer) do
-    case module.claim(key, meta, config) do
-      :ok ->
-        :ok
-
-      {:error, :replayed} ->
-        Logger.info(log("replayed", meta.payer, meta.tx_hash))
-        refuse(offer, :replayed, :logged)
-
-      _other ->
-        Logger.error(log("replay_guard_unavailable", meta.payer, meta.tx_hash))
-        {:error, :replay_guard_unavailable}
-    end
-  end
-
-  # A transaction hash already claimed means the facilitator reported one
-  # transaction for two different authorizations. Refuse, and say so loudly.
-  defp claim_tx(guard, settlement, payment, offer) do
-    key = "tx:" <> settlement.network <> ":" <> String.downcase(settlement.transaction)
-
-    case claim(guard, key, meta(:transaction, payment, offer, settlement.transaction), offer) do
-      :ok ->
-        :ok
-
-      other ->
-        Logger.error(log("transaction_already_claimed", payment.payer, settlement.transaction))
-        other
-    end
-  end
-
-  defp settled(settlement, payment, offer, opts) do
-    case Keyword.get(opts, :on_settled) do
-      nil ->
-        :ok
-
-      fun when is_function(fun, 1) ->
-        try do
-          case fun.(%{settlement: settlement, offer: offer, payer: payment.payer}) do
-            {:error, why} ->
-              Logger.error(
-                log("on_settled_failed", payment.payer, settlement.transaction) <>
-                  " reason=#{short(why)}"
-              )
-
-            _ ->
-              :ok
-          end
-        rescue
-          e ->
-            Logger.error(
-              log("on_settled_raised", payment.payer, settlement.transaction) <>
-                " exception=#{inspect(e.__struct__)}"
-            )
+  defp settle(%{facilitator: {module, config}} = ctx, request, payment, auth_key) do
+    case Safe.call(fn -> module.settle(request, config) end) do
+      {:ok, {:ok, %Settlement{} = s}} ->
+        with :ok <- consistent(ctx, s, payment) do
+          s = %{s | payer: payment.payer, payment_id: payment.payment_id}
+          record(ctx, s, payment, auth_key)
         end
+
+      {:ok, {:error, {:rejected, why}}} ->
+        Logger.warning(log("settlement_failed", payment.payer, nil) <> " reason=#{code(why)}")
+        refuse(ctx.offer, :settlement_failed, :logged)
+
+      {:ok, {:error, {:pending, tx}}} ->
+        Logger.error(log("settlement_pending", payment.payer, code(tx)) <> " reconcile=on_chain")
+        refuse(ctx.offer, :settlement_pending, :logged)
+
+      {:ok, {:error, why}} ->
+        settle_unavailable(short(why), payment)
+
+      {:ok, _other} ->
+        settle_unavailable("unexpected_return", payment)
+
+      {:caught, kind} ->
+        settle_unavailable("adapter_#{kind}", payment)
     end
   end
 
-  defp meta(kind, payment, offer, tx_hash \\ nil) do
+  # The facilitator's report must agree with what the client signed.
+  defp consistent(ctx, s, payment) do
+    cond do
+      s.amount != nil and s.amount != ctx.offer.amount ->
+        Logger.error(
+          log("settle_inconsistent", payment.payer, s.transaction) <>
+            " reason=amount_mismatch reconcile=on_chain"
+        )
+
+        {:error, :facilitator_unavailable}
+
+      s.payer != nil and not same_payer?(ctx.offer, s.payer, payment.payer) ->
+        Logger.error(
+          log("settle_inconsistent", payment.payer, s.transaction) <>
+            " reason=payer_mismatch reconcile=on_chain"
+        )
+
+        {:error, :facilitator_unavailable}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp same_payer?(offer, a, b) do
+    {:ok, scheme} = Scheme.for(offer.scheme, offer.network)
+    scheme.same_address?(a, b)
+  end
+
+  # The money has moved. First the durable record, then on_settled.
+  defp record(%{guard: {module, config}} = ctx, s, payment, auth_key) do
+    tx_key = "tx:" <> s.network <> ":" <> String.downcase(s.transaction)
+
+    meta =
+      ctx
+      |> meta(:transaction, payment)
+      |> Map.merge(%{tx_hash: s.transaction, auth_key: auth_key})
+
+    case Safe.call(fn -> module.claim(tx_key, meta, config) end) do
+      {:ok, :ok} ->
+        settled(ctx, s, payment, tx_key)
+        {:ok, s}
+
+      {:ok, {:error, :replayed}} ->
+        # The facilitator reported a transaction already claimed for another
+        # authorization: not a payment for this one.
+        Logger.error(log("transaction_already_claimed", payment.payer, s.transaction))
+        refuse(ctx.offer, :replayed, :logged)
+
+      _guard_error ->
+        Logger.error(log("tx_claim_failed", payment.payer, s.transaction) <> " served=true")
+        settled(ctx, s, payment, nil)
+        {:ok, s}
+    end
+  end
+
+  defp settled(%{on_settled: nil}, _s, _payment, _tx_key), do: :ok
+
+  defp settled(%{on_settled: fun} = ctx, s, payment, tx_key) do
+    case Safe.call(fn -> fun.(%{settlement: s, offer: ctx.offer, payer: payment.payer}) end) do
+      {:ok, {:ok, "pi_" <> _ = id}} when is_binary(tx_key) ->
+        store_payment_intent(ctx, tx_key, id, s, payment)
+
+      {:ok, {:error, why}} ->
+        Logger.error(
+          log("on_settled_failed", payment.payer, s.transaction) <> " reason=#{short(why)}"
+        )
+
+      {:caught, kind} ->
+        Logger.error(log("on_settled_crashed", payment.payer, s.transaction) <> " kind=#{kind}")
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp store_payment_intent(%{guard: {module, config}}, tx_key, id, s, payment) do
+    case Safe.call(fn -> module.record_payment_intent(tx_key, id, config) end) do
+      {:ok, :ok} ->
+        :ok
+
+      _ ->
+        Logger.error(
+          log("payment_intent_not_stored", payment.payer, s.transaction) <>
+            " payment_intent=#{code(id)}"
+        )
+    end
+  end
+
+  defp meta(ctx, kind, payment) do
     %{
       kind: kind,
-      network: offer.network,
+      app: ctx.app,
+      network: ctx.offer.network,
+      asset: ctx.offer.asset,
+      pay_to: ctx.offer.pay_to,
       payer: payment.payer,
-      amount: offer.amount,
-      resource: offer.resource,
-      tx_hash: tx_hash
+      amount: ctx.offer.amount,
+      resource: ctx.offer.resource,
+      tx_hash: nil,
+      auth_key: nil
     }
   end
 
-  defp unavailable(op, why, payment) do
-    Logger.error(log("#{op}_unavailable", payment.payer, nil) <> " reason=#{short(why)}")
+  defp unavailable(op, reason, payment) do
+    Logger.error(log("#{op}_unavailable", payment.payer, nil) <> " reason=#{reason}")
+    {:error, :facilitator_unavailable}
+  end
+
+  defp settle_unavailable(reason, payment) do
+    Logger.error(
+      log("settle_unavailable", payment.payer, nil) <>
+        " reason=#{reason} reconcile=check_payer_on_chain"
+    )
+
     {:error, :facilitator_unavailable}
   end
 
   defp refuse(offer, reason, payer) do
-    if payer != :logged, do: Logger.info(log(Atom.to_string(reason), payer, nil))
+    if payer != :logged do
+      level = if reason in @decode_reasons, do: :debug, else: :info
+      Logger.log(level, log(Atom.to_string(reason), payer, nil))
+    end
+
     {:payment_required, Offer.challenge_header(offer, Atom.to_string(reason)), reason}
   end
 
@@ -313,13 +529,8 @@ defmodule X402 do
   defp short(_), do: "other"
 
   # A facilitator adapter's reason or hash, printed only if it is a plain token.
-  defp code(s) when is_binary(s), do: if(s =~ ~r/\A[A-Za-z0-9_]{1,128}\z/, do: s, else: "unknown")
-  defp code(_), do: "unknown"
+  defp code(s) when is_binary(s),
+    do: if(s =~ ~r/\A[A-Za-z0-9_]{1,128}\z/, do: s, else: "unknown")
 
-  defp rename(opts, from, to) do
-    case Keyword.pop(opts, from) do
-      {nil, opts} -> opts
-      {value, opts} -> Keyword.put(opts, to, value)
-    end
-  end
+  defp code(_), do: "unknown"
 end

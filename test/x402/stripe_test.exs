@@ -65,6 +65,24 @@ defmodule X402.StripeTest do
            }
   end
 
+  test "the key may be a 0-arity function", ctx do
+    test = self()
+
+    stub(fn conn ->
+      send(test, {:auth, Plug.Conn.get_req_header(conn, "authorization")})
+      Req.Test.json(conn, %{"id" => "pi_fun"})
+    end)
+
+    assert {:ok, "pi_fun"} =
+             X402.Stripe.record(
+               fn -> @key end,
+               %{settlement: ctx.settlement, offer: ctx.offer},
+               ctx.opts
+             )
+
+    assert_received {:auth, ["Bearer " <> @key]}
+  end
+
   test "the version can be set per call", ctx do
     test = self()
 
@@ -139,8 +157,31 @@ defmodule X402.StripeTest do
     end
 
     test "an asset that is not USDC", ctx do
-      offer = Fixtures.offer(%{asset: "0x" <> String.duplicate("2", 40)})
+      offer =
+        Fixtures.offer(%{asset: "0x" <> String.duplicate("2", 40), allow_unknown_asset: true})
+
       assert record(%{ctx | offer: offer}) == {:error, :unsupported_asset}
+    end
+
+    test "a live key with Base Sepolia, or a test key with Base mainnet", ctx do
+      live = "sk_live_" <> String.duplicate("k", 24)
+
+      assert X402.Stripe.record(live, %{settlement: ctx.settlement, offer: ctx.offer}, ctx.opts) ==
+               {:error, :key_network_mismatch}
+
+      {:ok, usdc} = X402.Scheme.ExactEvm.usdc("eip155:8453")
+
+      mainnet =
+        Fixtures.offer(%{network: "eip155:8453", asset: usdc.asset, extra: usdc.extra})
+
+      assert record(%{ctx | offer: mainnet}) == {:error, :key_network_mismatch}
+
+      assert X402.Stripe.record(
+               "rk_live_x",
+               %{settlement: ctx.settlement, offer: ctx.offer},
+               ctx.opts
+             ) ==
+               {:error, :key_network_mismatch}
     end
 
     test "a key that is not a secret key", ctx do

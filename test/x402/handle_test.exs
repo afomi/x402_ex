@@ -20,6 +20,27 @@ defmodule X402.HandleTest do
     @behaviour X402.ReplayGuard
     @impl true
     def claim(_key, _meta, _config), do: {:error, :db_down}
+    @impl true
+    def record_payment_intent(_key, _id, _config), do: {:error, :db_down}
+    @impl true
+    def unrecorded(_limit, _config), do: {:error, :db_down}
+  end
+
+  # Memory, except that "tx:" claims fail in the way `mode` says.
+  defmodule TxFailGuard do
+    @moduledoc false
+    @behaviour X402.ReplayGuard
+    @impl true
+    def claim("tx:" <> _, _meta, {_agent, :error}), do: {:error, :db_down}
+    def claim("tx:" <> _, _meta, {_agent, :raise}), do: raise("db connection lost")
+    def claim("tx:" <> _, _meta, {_agent, :exit}), do: exit(:db_pool_timeout)
+    def claim(key, meta, {agent, _}), do: Memory.claim(key, meta, agent)
+    @impl true
+    def record_payment_intent(key, id, {agent, _}),
+      do: Memory.record_payment_intent(key, id, agent)
+
+    @impl true
+    def unrecorded(limit, {agent, _}), do: Memory.unrecorded(limit, agent)
   end
 
   setup do
@@ -38,6 +59,7 @@ defmodule X402.HandleTest do
 
     opts = [
       offer: offer,
+      scope: [app: "test-app", pay_to: Fixtures.pay_to()],
       facilitator: {X402.Facilitator.X402Org, req_options: [plug: {Req.Test, __MODULE__}]},
       replay_guard: {Memory, guard}
     ]
@@ -211,7 +233,12 @@ defmodule X402.HandleTest do
          {:ok, %Settlement{transaction: Fixtures.tx(), network: "eip155:84532"}}
        end}
 
-    opts = [offer: offer, facilitator: facilitator, replay_guard: {Memory, guard}]
+    opts = [
+      offer: offer,
+      scope: [app: "test-app", pay_to: Fixtures.pay_to()],
+      facilitator: facilitator,
+      replay_guard: {Memory, guard}
+    ]
 
     {results, _} =
       with_log(fn ->
@@ -373,6 +400,308 @@ defmodule X402.HandleTest do
       end)
 
     assert {:ok, _, _} = result
-    assert log =~ "outcome=on_settled_raised"
+    assert log =~ "outcome=on_settled_crashed"
+  end
+
+  ## M1: after settlement, nothing may leave a payment without a record.
+
+  defp fun_opts(ctx, settle, extra \\ []) do
+    facilitator =
+      {FunFacilitator, verify: fn _ -> {:ok, %{payer: Fixtures.payer()}} end, settle: settle}
+
+    Keyword.merge(ctx.opts, [facilitator: facilitator] ++ extra)
+  end
+
+  defp settled_ok(_request),
+    do: {:ok, %Settlement{transaction: Fixtures.tx(), network: "eip155:84532"}}
+
+  for mode <- [:error, :raise, :exit] do
+    test "a tx claim that fails (#{mode}) after settle still serves, calls on_settled and logs",
+         %{opts: opts, guard: guard, header: header} do
+      test = self()
+
+      opts =
+        opts
+        |> Keyword.put(:replay_guard, {TxFailGuard, {guard, unquote(mode)}})
+        |> Keyword.put(:on_settled, &send(test, {:on_settled, &1.settlement.transaction}))
+
+      {result, log} = with_log(fn -> X402.handle(conn(header), opts) end)
+
+      assert {:ok, _conn, %Settlement{}} = result
+      assert log =~ "outcome=tx_claim_failed"
+      assert log =~ Fixtures.tx()
+      refute log =~ "transaction_already_claimed"
+      assert_received {:on_settled, tx} when tx == unquote(Fixtures.tx())
+    end
+  end
+
+  for {kind, fun} <- [
+        exit: quote(do: fn _ -> exit(:finch_pool_timeout) end),
+        throw: quote(do: fn _ -> throw(:nope) end),
+        raise: quote(do: fn _ -> raise "boom" end)
+      ] do
+    test "an on_settled that #{kind}s still serves, and leaves the row for the reconciler",
+         %{opts: opts, guard: guard, header: header} do
+      {result, log} =
+        with_log(fn ->
+          X402.handle(conn(header), Keyword.put(opts, :on_settled, unquote(fun)))
+        end)
+
+      assert {:ok, _, _} = result
+      assert log =~ "outcome=on_settled_crashed"
+      assert {:ok, [%{tx_hash: tx}]} = Memory.unrecorded(10, guard)
+      assert tx == Fixtures.tx()
+    end
+  end
+
+  for {kind, fun} <- [
+        raise: quote(do: fn _ -> raise "finch exploded" end),
+        exit: quote(do: fn _ -> exit(:killed) end),
+        throw: quote(do: fn _ -> throw(:oops) end)
+      ] do
+    test "a facilitator adapter that #{kind}s in settle fails closed, with the reconcile line",
+         ctx do
+      {result, log} =
+        with_log(fn -> X402.handle(conn(ctx.header), fun_opts(ctx, unquote(fun))) end)
+
+      assert result == {:error, :facilitator_unavailable}
+      assert log =~ "outcome=settle_unavailable"
+      assert log =~ "reconcile=check_payer_on_chain"
+      assert [auth_key] = Map.keys(Memory.claims(ctx.guard))
+      assert String.starts_with?(auth_key, "auth:")
+    end
+  end
+
+  test "a facilitator adapter that raises in verify fails closed, with nothing claimed", ctx do
+    facilitator =
+      {FunFacilitator, verify: fn _ -> raise "boom" end, settle: &settled_ok/1}
+
+    {result, _} =
+      with_log(fn ->
+        X402.handle(conn(ctx.header), Keyword.put(ctx.opts, :facilitator, facilitator))
+      end)
+
+    assert result == {:error, :facilitator_unavailable}
+    assert Memory.claims(ctx.guard) == %{}
+  end
+
+  test "a request process killed mid-settle: the settlement is still recorded", ctx do
+    test = self()
+
+    settle = fn request ->
+      send(test, {:settling, self()})
+
+      receive do
+        :go -> settled_ok(request)
+      end
+    end
+
+    opts =
+      fun_opts(ctx, settle, on_settled: fn _ -> send(test, :on_settled) && {:ok, "pi_late"} end)
+
+    request_pid =
+      spawn(fn ->
+        Logger.disable(self())
+        X402.handle(conn(ctx.header), opts)
+      end)
+
+    assert_receive {:settling, settle_pid}
+    Process.exit(request_pid, :kill)
+    refute Process.alive?(request_pid)
+
+    send(settle_pid, :go)
+    assert_receive :on_settled
+
+    tx_key = "tx:eip155:84532:" <> Fixtures.tx()
+
+    wait_until(fn ->
+      match?(%{payment_intent_id: "pi_late"}, Memory.claims(ctx.guard)[tx_key])
+    end)
+  end
+
+  test "past settle_await_ms the request fails closed, and the work still completes", ctx do
+    test = self()
+
+    settle = fn request ->
+      receive do
+        :go -> settled_ok(request)
+      end
+    end
+
+    opts =
+      fun_opts(ctx, settle,
+        settle_await_ms: 50,
+        on_settled: fn _ -> send(test, :recorded) && {:ok, "pi_slow"} end
+      )
+
+    {result, log} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+    assert result == {:error, :facilitator_unavailable}
+    assert log =~ "outcome=settle_still_running"
+
+    [settle_pid] =
+      Task.Supervisor.children(X402.TaskSupervisor)
+      |> Enum.filter(
+        &(Process.info(&1, :dictionary) |> elem(1) |> Keyword.get(:"$callers") == [test])
+      )
+
+    send(settle_pid, :go)
+    assert_receive :recorded
+  end
+
+  test "the PaymentIntent id from on_settled is stored on the tx row", ctx do
+    opts = Keyword.put(ctx.opts, :on_settled, fn _ -> {:ok, "pi_123"} end)
+    assert {:ok, _, _} = handle(ctx.header, opts)
+
+    assert %{payment_intent_id: "pi_123", auth_key: "auth:" <> _, app: "test-app"} =
+             Memory.claims(ctx.guard)["tx:eip155:84532:" <> Fixtures.tx()]
+
+    assert Memory.unrecorded(10, ctx.guard) == {:ok, []}
+  end
+
+  test "the reconciler records a settlement whose Stripe call failed, once", ctx do
+    opts = Keyword.put(ctx.opts, :on_settled, fn _ -> {:error, :stripe_unavailable} end)
+    assert {:ok, _, _} = handle(ctx.header, opts)
+    assert {:ok, [_]} = Memory.unrecorded(10, ctx.guard)
+
+    test = self()
+
+    stub(fn conn ->
+      send(test, {:stripe, Plug.Conn.get_req_header(conn, "idempotency-key")})
+      Req.Test.json(conn, %{"id" => "pi_reconciled"})
+    end)
+
+    stripe_opts = [req_options: [plug: {Req.Test, __MODULE__}]]
+
+    {result, _} =
+      with_log(fn ->
+        X402.Reconciler.record_unrecorded({Memory, ctx.guard}, "sk_test_x",
+          stripe_opts: stripe_opts
+        )
+      end)
+
+    assert result == {:ok, %{recorded: [{Fixtures.tx(), "pi_reconciled"}], failed: []}}
+    assert_received {:stripe, [tx]} when tx == unquote(Fixtures.tx())
+    assert Memory.unrecorded(10, ctx.guard) == {:ok, []}
+
+    assert X402.Reconciler.record_unrecorded({Memory, ctx.guard}, "sk_test_x",
+             stripe_opts: stripe_opts
+           ) ==
+             {:ok, %{recorded: [], failed: []}}
+  end
+
+  test "the reconciler reports a Stripe failure and leaves the row", ctx do
+    opts = Keyword.put(ctx.opts, :on_settled, fn _ -> {:error, :stripe_unavailable} end)
+    assert {:ok, _, _} = handle(ctx.header, opts)
+
+    stub(&Req.Test.transport_error(&1, :econnrefused))
+
+    {result, _} =
+      with_log(fn ->
+        X402.Reconciler.record_unrecorded({Memory, ctx.guard}, "sk_test_x",
+          stripe_opts: [req_options: [plug: {Req.Test, __MODULE__}]]
+        )
+      end)
+
+    assert result == {:ok, %{recorded: [], failed: [{Fixtures.tx(), :stripe_unavailable}]}}
+    assert {:ok, [_]} = Memory.unrecorded(10, ctx.guard)
+  end
+
+  ## L1: the facilitator's report must agree with what was signed.
+
+  test "a settle reporting another payer fails closed", ctx do
+    stub(fn conn ->
+      case conn.request_path do
+        "/facilitator/verify" ->
+          Req.Test.json(conn, Fixtures.verify_ok())
+
+        "/facilitator/settle" ->
+          Req.Test.json(
+            conn,
+            Map.put(Fixtures.settle_ok(), "payer", "0x" <> String.duplicate("9", 40))
+          )
+      end
+    end)
+
+    {result, log} = with_log(fn -> X402.handle(conn(ctx.header), ctx.opts) end)
+    assert result == {:error, :facilitator_unavailable}
+    assert log =~ "reason=payer_mismatch"
+  end
+
+  test "a settle reporting another amount fails closed", ctx do
+    stub(fn conn ->
+      case conn.request_path do
+        "/facilitator/verify" -> Req.Test.json(conn, Fixtures.verify_ok())
+        "/facilitator/settle" -> Req.Test.json(conn, Map.put(Fixtures.settle_ok(), "amount", "1"))
+      end
+    end)
+
+    assert handle(ctx.header, ctx.opts) == {:error, :facilitator_unavailable}
+  end
+
+  test "a verify reporting another payer fails closed, with nothing claimed", ctx do
+    stub(&Req.Test.json(&1, %{"isValid" => true, "payer" => "0x" <> String.duplicate("9", 40)}))
+    assert handle(ctx.header, ctx.opts) == {:error, :facilitator_unavailable}
+    assert Memory.claims(ctx.guard) == %{}
+  end
+
+  test "the PAYMENT-RESPONSE payer is the signed payer, in the facilitator's case or not", ctx do
+    stub(fn conn ->
+      case conn.request_path do
+        "/facilitator/verify" ->
+          Req.Test.json(conn, Fixtures.verify_ok())
+
+        "/facilitator/settle" ->
+          Req.Test.json(
+            conn,
+            Map.put(Fixtures.settle_ok(), "payer", String.downcase(Fixtures.payer()))
+          )
+      end
+    end)
+
+    assert {:ok, _, %Settlement{payer: payer}} = handle(ctx.header, ctx.opts)
+    assert payer == Fixtures.payer()
+  end
+
+  ## M2 and L4: options.
+
+  test "an offer to an address other than the app's deposit address raises", ctx do
+    opts =
+      Keyword.put(ctx.opts, :scope, app: "test-app", pay_to: "0x" <> String.duplicate("3", 40))
+
+    assert_raise ArgumentError, ~r/not the deposit address of app "test-app"/, fn ->
+      X402.handle(conn(ctx.header), opts)
+    end
+  end
+
+  test "the scope's address compares case-insensitively", ctx do
+    opts =
+      Keyword.put(ctx.opts, :scope, app: "test-app", pay_to: String.downcase(Fixtures.pay_to()))
+
+    assert {:payment_required, _} = handle(nil, opts)
+  end
+
+  for key <- [:offer, :scope, :facilitator, :replay_guard] do
+    test "a missing #{key} raises naming it, and prints no other option", ctx do
+      secret = "cdp-secret-#{System.unique_integer([:positive])}"
+      opts = ctx.opts |> Keyword.delete(unquote(key)) |> Keyword.put(:extra_secret, secret)
+
+      error = assert_raise ArgumentError, fn -> X402.handle(conn(nil), opts) end
+      assert Exception.message(error) == "X402.handle/2: missing #{inspect(unquote(key))}"
+      refute Exception.message(error) =~ secret
+    end
+  end
+
+  test "an invalid facilitator option raises without printing it", ctx do
+    opts = Keyword.put(ctx.opts, :facilitator, key_secret: "s3cret")
+    error = assert_raise ArgumentError, fn -> X402.handle(conn(nil), opts) end
+    refute Exception.message(error) =~ "s3cret"
+  end
+
+  defp wait_until(fun, tries \\ 50) do
+    cond do
+      fun.() -> :ok
+      tries == 0 -> flunk("condition never held")
+      true -> Process.sleep(10) && wait_until(fun, tries - 1)
+    end
   end
 end

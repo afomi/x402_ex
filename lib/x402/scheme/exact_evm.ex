@@ -56,7 +56,25 @@ defmodule X402.Scheme.ExactEvm do
       not is_binary(offer.extra["name"]) -> {:error, :missing_extra_name}
       not is_binary(offer.extra["version"]) -> {:error, :missing_extra_version}
       not eip3009?(offer.extra) -> {:error, :unsupported_asset_transfer_method}
-      true -> :ok
+      true -> known_asset(offer)
+    end
+  end
+
+  # Where we know the network's USDC, an offer must use it exactly, unless
+  # it says otherwise (`allow_unknown_asset: true`).
+  defp known_asset(%{allow_unknown_asset: true}), do: :ok
+
+  defp known_asset(offer) do
+    case usdc(offer.network) do
+      {:ok, %{asset: asset, extra: extra}} ->
+        cond do
+          not same_address?(asset, offer.asset) -> {:error, :unknown_asset_for_network}
+          Map.take(offer.extra, ["name", "version"]) != extra -> {:error, :wrong_asset_domain}
+          true -> :ok
+        end
+
+      :error ->
+        :ok
     end
   end
 

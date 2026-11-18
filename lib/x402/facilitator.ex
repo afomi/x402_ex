@@ -23,7 +23,11 @@ defmodule X402.Facilitator do
     * `{:error, {:pending, tx_hash}}`: settle returned `settlement_pending`
       (spec 9): broadcast, not confirmed. Not a success.
     * `{:error, :timeout | :unavailable | {:http_status, status} |
-      :invalid_response | :not_implemented}`: anything else.
+      :invalid_response | :invalid_config | :req_options_not_allowed |
+      :not_implemented}`: anything else.
+
+  An adapter should return, not raise; `X402.handle/2` still catches a raise,
+  throw or exit from either call and fails closed.
 
   Every outcome but `{:ok, _}` is an error; `X402.handle/2` fails closed on all of them.
   """
@@ -38,6 +42,8 @@ defmodule X402.Facilitator do
           | :unavailable
           | {:http_status, non_neg_integer()}
           | :invalid_response
+          | :invalid_config
+          | :req_options_not_allowed
           | :not_implemented
 
   @callback verify(request(), keyword()) :: {:ok, %{payer: String.t() | nil}} | {:error, error()}

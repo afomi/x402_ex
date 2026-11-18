@@ -22,6 +22,10 @@ defmodule X402.Payment do
 
   alias X402.{Codec, Offer, Scheme}
 
+  # Until it is settled, the signed authorization in `raw` and `payload` is a
+  # bearer credential: whoever presents it first is served. Keep it out of
+  # inspect output (crash reports, debug logs, process views).
+  @derive {Inspect, except: [:raw, :payload]}
   @enforce_keys [:accepted, :payload, :raw]
   defstruct [:accepted, :payload, :resource, :raw, :payer, :payment_id]
 

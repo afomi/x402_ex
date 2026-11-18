@@ -8,19 +8,20 @@ defmodule X402.Facilitator.HTTP do
 
     * no retries, and redirects are not followed (a facilitator that moves
       should be reconfigured, not followed with payment data);
-    * short timeouts: `:connect_timeout` (default 2,000 ms) and
-      `:receive_timeout` (default 5,000 ms for verify, 15,000 ms for settle,
-      which waits for a transaction receipt);
-    * the response body is parsed by us with string keys, never as atoms.
+    * short timeouts: `:connect_timeout` (default 2,000 ms), and a deadline
+      for the whole response of `:verify_timeout` (default 5,000 ms) or
+      `:settle_timeout` (default 15,000 ms, which waits for a receipt);
+    * the response body is capped at 64 KB, uncompressed, and parsed by us
+      with string keys, never as atoms (`X402.HTTPClient`).
 
   Config keys: `:url` (required), `:headers` (extra request headers, e.g.
   auth), `:connect_timeout`, `:verify_timeout`, `:settle_timeout`, and
-  `:req_options` (merged into the Req request; tests pass `plug:` here).
+  `:req_options` (the test seam; see `X402.HTTPClient`).
   """
 
   require Logger
 
-  alias X402.{Scheme, Settlement}
+  alias X402.{HTTPClient, Scheme, Settlement}
 
   @reason ~r/\A[a-z0-9_]{1,64}\z/
 
@@ -39,32 +40,30 @@ defmodule X402.Facilitator.HTTP do
   end
 
   defp post(config, path, request, timeout_key, default_timeout) do
-    url = Keyword.fetch!(config, :url) |> String.trim_trailing("/")
+    case Keyword.get(config, :url) do
+      url when is_binary(url) ->
+        timeout = Keyword.get(config, timeout_key, default_timeout)
 
-    req =
-      Req.new(
-        method: :post,
-        url: url <> path,
-        json: request,
-        headers: Keyword.get(config, :headers, []),
-        retry: false,
-        redirect: false,
-        decode_body: false,
-        connect_options: [timeout: Keyword.get(config, :connect_timeout, 2_000)],
-        receive_timeout: Keyword.get(config, timeout_key, default_timeout)
-      )
-      |> Req.merge(Keyword.get(config, :req_options, []))
+        req = [
+          method: :post,
+          url: String.trim_trailing(url, "/") <> path,
+          json: request,
+          headers: Keyword.get(config, :headers, []),
+          connect_options: [timeout: Keyword.get(config, :connect_timeout, 2_000)],
+          receive_timeout: timeout
+        ]
 
-    case Req.request(req) do
-      {:ok, %Req.Response{status: status, body: body}} ->
-        {:ok, status, decode(body)}
+        case HTTPClient.request(req,
+               deadline_ms: timeout,
+               req_options: Keyword.get(config, :req_options, [])
+             ) do
+          {:ok, status, body} -> {:ok, status, decode(body)}
+          {:error, :too_large} -> {:error, :invalid_response}
+          {:error, reason} -> {:error, reason}
+        end
 
-      {:error, %Req.TransportError{reason: :timeout}} ->
-        {:error, :timeout}
-
-      {:error, exception} ->
-        Logger.warning("x402 facilitator #{path} unreachable: #{exception_name(exception)}")
-        {:error, :unavailable}
+      _ ->
+        {:error, :invalid_config}
     end
   end
 
@@ -104,7 +103,13 @@ defmodule X402.Facilitator.HTTP do
          true <- body["network"] == network,
          true <- is_nil(payer) or module.valid_address?(payer),
          true <- is_nil(body["amount"]) or uint?(body["amount"]) do
-      {:ok, %Settlement{transaction: tx, network: network, payer: payer, amount: body["amount"]}}
+      {:ok,
+       %Settlement{
+         transaction: String.downcase(tx),
+         network: network,
+         payer: payer,
+         amount: body["amount"]
+       }}
     else
       _ -> {:error, :invalid_response}
     end
@@ -147,11 +152,4 @@ defmodule X402.Facilitator.HTTP do
 
   defp reason(r) when is_binary(r), do: if(r =~ @reason, do: r, else: "unknown")
   defp reason(_), do: "unknown"
-
-  defp exception_name(%{__struct__: mod} = e) do
-    case e do
-      %Req.TransportError{reason: reason} when is_atom(reason) -> inspect(reason)
-      _ -> inspect(mod)
-    end
-  end
 end

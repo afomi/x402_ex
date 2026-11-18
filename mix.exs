@@ -19,6 +19,7 @@ defmodule X402.MixProject do
 
   def application do
     [
+      mod: {X402.Application, []},
       extra_applications: [:logger]
     ]
   end

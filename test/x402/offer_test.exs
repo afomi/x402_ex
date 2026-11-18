@@ -71,6 +71,56 @@ defmodule X402.OfferTest do
     end
   end
 
+  describe "on a network whose USDC is known" do
+    test "refuses another token, or USDC from another network" do
+      assert Offer.new(offer_attrs(%{asset: "0x" <> String.duplicate("2", 40)})) ==
+               {:error, :unknown_asset_for_network}
+
+      # Base mainnet's USDC on Base Sepolia: a copied config.
+      assert Offer.new(offer_attrs(%{asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"})) ==
+               {:error, :unknown_asset_for_network}
+    end
+
+    test "refuses the wrong EIP-712 domain" do
+      {:ok, usdc} = X402.Scheme.ExactEvm.usdc("eip155:8453")
+
+      # Base Sepolia's domain name ("USDC") on mainnet, where it is "USD Coin".
+      attrs =
+        offer_attrs(%{
+          network: "eip155:8453",
+          asset: usdc.asset,
+          extra: %{"name" => "USDC", "version" => "2"}
+        })
+
+      assert Offer.new(attrs) == {:error, :wrong_asset_domain}
+    end
+
+    test "allows another token when the offer says so" do
+      attrs = offer_attrs(%{asset: "0x" <> String.duplicate("2", 40), allow_unknown_asset: true})
+      assert {:ok, %Offer{allow_unknown_asset: true}} = Offer.new(attrs)
+    end
+
+    test "allows any token on a network it does not know" do
+      attrs = offer_attrs(%{network: "eip155:1", asset: "0x" <> String.duplicate("2", 40)})
+      assert {:ok, _} = Offer.new(attrs)
+    end
+  end
+
+  defp offer_attrs(overrides) do
+    Map.merge(
+      %{
+        amount: 10_000,
+        network: "eip155:84532",
+        asset: Fixtures.asset(),
+        extra: %{"name" => "USDC", "version" => "2"},
+        pay_to: Fixtures.pay_to(),
+        resource: Fixtures.resource(),
+        max_timeout_seconds: 60
+      },
+      overrides
+    )
+  end
+
   test "USDC on Base and Base Sepolia" do
     assert {:ok, %{asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"}} =
              X402.Scheme.ExactEvm.usdc("eip155:8453")

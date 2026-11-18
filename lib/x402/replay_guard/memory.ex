@@ -4,8 +4,8 @@ defmodule X402.ReplayGuard.Memory do
 
   It forgets every claim when its process stops and knows nothing of other
   nodes, so in production it would let a payment be replayed after a restart
-  or on another instance. Use a database table with a unique index instead
-  (README, "Replay guard").
+  or on another instance, and would lose the record of settled payments.
+  Use a database table with a unique index instead (README, "Replay guard").
 
       {:ok, guard} = X402.ReplayGuard.Memory.start_link()
       replay_guard: {X402.ReplayGuard.Memory, guard}
@@ -27,11 +27,39 @@ defmodule X402.ReplayGuard.Memory do
       if Map.has_key?(claims, key) do
         {{:error, :replayed}, claims}
       else
-        {:ok, Map.put(claims, key, meta)}
+        row = meta |> Map.put(:key, key) |> Map.put(:payment_intent_id, nil)
+        {:ok, Map.put(claims, key, row)}
       end
     end)
   end
 
-  @doc "Every claim so far, `%{key => meta}` (for assertions)."
+  @impl true
+  def record_payment_intent(tx_key, payment_intent_id, agent) do
+    Agent.get_and_update(agent, fn claims ->
+      case claims do
+        %{^tx_key => row} ->
+          {:ok, Map.put(claims, tx_key, %{row | payment_intent_id: payment_intent_id})}
+
+        _ ->
+          {{:error, :not_found}, claims}
+      end
+    end)
+  end
+
+  @impl true
+  def unrecorded(limit, agent) do
+    rows =
+      agent
+      |> claims()
+      |> Map.values()
+      |> Enum.filter(&(&1.kind == :transaction and is_nil(&1.payment_intent_id)))
+      |> Enum.sort_by(& &1.key)
+      |> Enum.take(limit)
+      |> Enum.map(&Map.take(&1, [:key, :tx_hash, :network, :asset, :amount]))
+
+    {:ok, rows}
+  end
+
+  @doc "Every claim so far, `%{key => row}` (for assertions)."
   def claims(agent), do: Agent.get(agent, & &1)
 end

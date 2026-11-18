@@ -165,6 +165,33 @@ defmodule X402.FacilitatorTest do
     assert X402Org.settle(request, config) == {:error, {:http_status, 503}}
   end
 
+  test "a response body over 64 KB is refused", %{request: request, config: config} do
+    stub(&json(&1, 200, %{"isValid" => true, "padding" => String.duplicate("x", 70_000)}))
+    assert X402Org.verify(request, config) == {:error, :invalid_response}
+  end
+
+  test "a gzip body is not decompressed", %{request: request, config: config} do
+    stub(fn conn ->
+      conn
+      |> Plug.Conn.put_resp_header("content-encoding", "gzip")
+      |> Plug.Conn.send_resp(200, :zlib.gzip(Jason.encode!(Fixtures.verify_ok())))
+    end)
+
+    assert X402Org.verify(request, config) == {:error, :invalid_response}
+  end
+
+  test "a body that trickles past the deadline is a timeout", %{request: request, config: config} do
+    stub(fn conn ->
+      conn = Plug.Conn.send_chunked(conn, 200)
+      {:ok, conn} = Plug.Conn.chunk(conn, "{")
+      Process.sleep(60)
+      {:ok, conn} = Plug.Conn.chunk(conn, "}")
+      conn
+    end)
+
+    assert X402Org.verify(request, config ++ [verify_timeout: 20]) == {:error, :timeout}
+  end
+
   test "the default URL is x402.org" do
     assert X402Org.default_url() == "https://x402.org/facilitator"
   end
@@ -173,10 +200,31 @@ defmodule X402.FacilitatorTest do
     test "with only a key id and secret, sends nothing and is not implemented",
          %{request: request, config: config} do
       stub(fn _ -> flunk("no request should be sent") end)
-      config = config ++ [key_id: "id", key_secret: "secret"]
+      config = config ++ [key_id: "id", key_secret: fn -> "secret" end]
 
       assert CDP.verify(request, config) == {:error, :not_implemented}
       assert CDP.settle(request, config) == {:error, :not_implemented}
+    end
+
+    test "a secret given as a bare string is refused", %{request: request, config: config} do
+      stub(fn _ -> flunk("no request should be sent") end)
+      config = config ++ [key_id: "id", key_secret: "secret"]
+      assert CDP.verify(request, config) == {:error, :invalid_config}
+    end
+
+    test "a :url in config cannot send the JWT elsewhere", %{request: request, config: config} do
+      test = self()
+
+      stub(fn conn ->
+        send(test, {:host, conn.host})
+        json(conn, 200, Fixtures.verify_ok())
+      end)
+
+      auth = fn _, _, _ -> {:ok, [{"authorization", "Bearer jwt"}]} end
+      config = config ++ [url: "https://evil.example/x402", auth_headers: auth]
+
+      assert {:ok, _} = CDP.verify(request, config)
+      assert_received {:host, "api.cdp.coinbase.com"}
     end
 
     test "with an auth_headers function, calls CDP's paths with its headers",

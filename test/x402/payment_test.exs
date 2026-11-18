@@ -73,6 +73,14 @@ defmodule X402.PaymentTest do
     end
   end
 
+  test "inspect never shows the signed authorization", %{payment: p} do
+    {:ok, payment} = Payment.decode(Fixtures.header(p))
+    out = inspect(payment)
+    refute out =~ String.duplicate("ab", 65)
+    refute out =~ Fixtures.nonce()
+    refute out =~ "signature"
+  end
+
   test "decodes unpadded base64", %{payment: p} do
     header = p |> Jason.encode!() |> Base.encode64(padding: false)
     assert {:ok, %Payment{}} = Payment.decode(header)
