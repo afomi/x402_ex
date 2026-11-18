@@ -3,6 +3,15 @@
 This project follows [Semantic Versioning](https://semver.org).
 Before 1.0, a minor version may change the API; each change is listed here.
 
+## Unreleased
+
+- `X402.handle/2` checks every settlement an adapter returns before serving, not only `X402.Facilitator.HTTP`'s: the transaction hash must be well formed for the scheme and the network must be the offer's.
+  One that is not is not served (`{:error, :facilitator_unavailable}`), and is logged as `outcome=settle_unavailable` with `reason=invalid_transaction` or `reason=settlement_network_mismatch` and `reconcile=check_payer_on_chain`.
+  A hash in mixed case is lowercased once, so the `"tx:"` key, the row's `tx_hash`, Stripe's idempotency key and `PAYMENT-RESPONSE` agree; before, the key was lowercased and the row and the header were not.
+- CI also checks the lockfile (`mix deps.get --check-locked`), builds the docs with warnings as errors and builds the Hex package; `CONTRIBUTING.md` ships in the package.
+- `docs/SPEC_NOTES.md` re-read against the x402 Foundation repository: standard base64 only and strict `value == amount` are confirmed from the reference code, and the reference server's retry of `settlement_pending` is noted.
+- README: browser clients need `PAYMENT-RESPONSE` in `Access-Control-Expose-Headers`; a reconciler run that overlaps a request's Stripe call gets a 409 and finishes next time.
+
 ## v0.1.0 (2026-11-18)
 
 The first release.

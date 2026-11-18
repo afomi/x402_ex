@@ -50,7 +50,7 @@ defmodule X402.MixProject do
         "x402 spec" => "https://github.com/coinbase/x402"
       },
       files:
-        ~w(lib docs/SPEC_NOTES.md mix.exs README.md CHANGELOG.md SECURITY.md LICENSE .formatter.exs)
+        ~w(lib docs/SPEC_NOTES.md mix.exs README.md CHANGELOG.md SECURITY.md CONTRIBUTING.md LICENSE .formatter.exs)
     ]
   end
 

@@ -13,7 +13,9 @@ defmodule X402.Reconciler do
   It is idempotent: Stripe's idempotency key is the transaction hash, so a
   payment recorded by the request but not yet marked returns the same
   PaymentIntent. Stripe keeps idempotency keys for 24 hours, so run it well
-  within the day.
+  within the day. A run that overlaps a request's own Stripe call for the
+  same hash gets a 409 (`idempotency_key_in_use`) for that row; it is
+  reported in `failed` and the next run finishes it.
 
   Rows with `kind: :transaction_disputed` (a settle whose report
   contradicted the signed payment) are not booked: `unrecorded/2` returns
