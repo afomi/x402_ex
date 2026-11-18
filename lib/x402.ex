@@ -109,6 +109,15 @@ defmodule X402 do
       `outcome=settle_inconsistent`. The reconciler does not book it to
       Stripe; it needs a person and a check on chain.
 
+  A settlement is checked the same way whichever adapter returned it: a
+  transaction hash that is not well formed for the scheme, or a network other
+  than the offer's, is not served (`{:error, :facilitator_unavailable}`) and
+  is logged as `outcome=settle_unavailable` with `reason=invalid_transaction`
+  or `reason=settlement_network_mismatch` and `reconcile=check_payer_on_chain`;
+  nothing it reports can be keyed or recorded. A well-formed hash is
+  lowercased once, so the `"tx:"` key, the row, Stripe's idempotency key and
+  `PAYMENT-RESPONSE` all carry the same form.
+
   Before it succeeds, a facilitator adapter that raises, throws or exits is
   treated as the facilitator being unavailable, and fails closed.
 
@@ -396,13 +405,21 @@ defmodule X402 do
   defp settle(%{facilitator: {module, config}} = ctx, request, payment, auth_key) do
     case Safe.call(fn -> module.settle(request, config) end) do
       {:ok, {:ok, %Settlement{} = s}} ->
-        case consistent(ctx, s, payment) do
-          :ok ->
-            s = %{s | payer: payment.payer, payment_id: payment.payment_id}
-            record(ctx, s, payment, auth_key)
+        case well_formed(ctx, s) do
+          {:ok, s} ->
+            case consistent(ctx, s, payment) do
+              :ok ->
+                s = %{s | payer: payment.payer, payment_id: payment.payment_id}
+                record(ctx, s, payment, auth_key)
 
-          {:mismatch, reason} ->
-            dispute(ctx, s, payment, auth_key, reason)
+              {:mismatch, reason} ->
+                dispute(ctx, s, payment, auth_key, reason)
+            end
+
+          {:malformed, reason} ->
+            # Whatever adapter this came from, nothing here can be keyed,
+            # recorded or shown to the client; the money may still have moved.
+            settle_unavailable(Atom.to_string(reason), payment)
         end
 
       {:ok, {:error, {:rejected, why}}} ->
@@ -424,6 +441,22 @@ defmodule X402 do
     end
   end
 
+  # A settlement is checked here whichever adapter returned it: the hash must
+  # be well formed for the offer's scheme and the network the offer's, and
+  # the hash is lowercased once, so the "tx:" key, the row, Stripe's
+  # idempotency key and PAYMENT-RESPONSE all carry the same form.
+  defp well_formed(ctx, %Settlement{} = s) do
+    {:ok, scheme} = Scheme.for(ctx.offer.scheme, ctx.offer.network)
+
+    cond do
+      not scheme.valid_transaction?(s.transaction) -> {:malformed, :invalid_transaction}
+      s.network != ctx.offer.network -> {:malformed, :settlement_network_mismatch}
+      true -> {:ok, %{s | transaction: String.downcase(s.transaction)}}
+    end
+  end
+
+  defp tx_key(%Settlement{} = s), do: "tx:" <> s.network <> ":" <> s.transaction
+
   # The facilitator's report must agree with what the client signed.
   defp consistent(ctx, s, payment) do
     cond do
@@ -443,26 +476,19 @@ defmodule X402 do
   # reconciler to see (it is not booked to Stripe: we don't believe its
   # amount), and serve nothing.
   defp dispute(%{guard: {module, config}} = ctx, s, payment, auth_key, reason) do
-    tx = String.downcase(s.transaction)
+    meta =
+      ctx
+      |> meta(:transaction_disputed, payment)
+      |> Map.merge(%{tx_hash: s.transaction, auth_key: auth_key, dispute: reason})
 
     written =
-      with {:ok, scheme} <- Scheme.for(ctx.offer.scheme, ctx.offer.network),
-           true <- scheme.valid_transaction?(tx) do
-        meta =
-          ctx
-          |> meta(:transaction_disputed, payment)
-          |> Map.merge(%{tx_hash: tx, auth_key: auth_key, dispute: reason})
-
-        case Safe.call(fn -> module.claim("tx:" <> s.network <> ":" <> tx, meta, config) end) do
-          {:ok, :ok} -> "true"
-          _ -> "false"
-        end
-      else
+      case Safe.call(fn -> module.claim(tx_key(s), meta, config) end) do
+        {:ok, :ok} -> "true"
         _ -> "false"
       end
 
     Logger.error(
-      log("settle_inconsistent", payment.payer, code(tx)) <>
+      log("settle_inconsistent", payment.payer, s.transaction) <>
         " reason=#{reason} disputed_row=#{written} reconcile=on_chain"
     )
 
@@ -476,7 +502,7 @@ defmodule X402 do
 
   # The money has moved. First the durable record, then on_settled.
   defp record(%{guard: {module, config}} = ctx, s, payment, auth_key) do
-    tx_key = "tx:" <> s.network <> ":" <> String.downcase(s.transaction)
+    tx_key = tx_key(s)
 
     meta =
       ctx

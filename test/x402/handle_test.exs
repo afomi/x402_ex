@@ -694,6 +694,74 @@ defmodule X402.HandleTest do
     assert {:payment_required, _, :replayed} = handle(ctx.header, ctx.opts)
   end
 
+  ## A settlement is checked whichever adapter returned it.
+
+  for {name, settlement, reason} <- [
+        {"a malformed transaction hash",
+         quote(do: %Settlement{transaction: "0xnot", network: "eip155:84532"}),
+         "invalid_transaction"},
+        {"no transaction hash", quote(do: %Settlement{transaction: nil, network: "eip155:84532"}),
+         "invalid_transaction"},
+        {"another network",
+         quote(do: %Settlement{transaction: Fixtures.tx(), network: "eip155:8453"}),
+         "settlement_network_mismatch"}
+      ] do
+    test "a settlement with #{name} from an adapter fails closed, serving and recording nothing",
+         ctx do
+      test = self()
+
+      opts =
+        fun_opts(ctx, fn _ -> {:ok, unquote(settlement)} end,
+          on_settled: fn _ -> send(test, :on_settled) end
+        )
+
+      {result, log} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+
+      assert result == {:error, :facilitator_unavailable}
+      assert log =~ "outcome=settle_unavailable"
+      assert log =~ " reason=#{unquote(reason)} "
+      assert log =~ "reconcile=check_payer_on_chain"
+      refute_received :on_settled
+
+      # Only the authorization is claimed; no "tx:" row can be keyed on it.
+      assert [auth_key] = Map.keys(Memory.claims(ctx.guard))
+      assert String.starts_with?(auth_key, "auth:")
+    end
+  end
+
+  test "a transaction hash an adapter reports in mixed case is stored, keyed and shown lowercase",
+       ctx do
+    mixed =
+      "0x" <>
+        String.upcase(String.slice(Fixtures.tx(), 2, 32)) <>
+        String.slice(Fixtures.tx(), 34..-1//1)
+
+    assert mixed != Fixtures.tx()
+    test = self()
+
+    opts =
+      fun_opts(ctx, fn _ -> {:ok, %Settlement{transaction: mixed, network: "eip155:84532"}} end,
+        on_settled: fn %{settlement: s} ->
+          send(test, {:on_settled, s.transaction}) && {:ok, "pi_x"}
+        end
+      )
+
+    {result, _} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+    assert {:ok, conn, %Settlement{transaction: tx}} = result
+    assert tx == Fixtures.tx()
+
+    assert [response] = Plug.Conn.get_resp_header(conn, "payment-response")
+    assert {:ok, %{"transaction" => ^tx}} = Codec.decode(response)
+
+    assert_received {:on_settled, ^tx}
+
+    assert %{tx_hash: ^tx, payment_intent_id: "pi_x"} =
+             Memory.claims(ctx.guard)["tx:eip155:84532:" <> Fixtures.tx()]
+
+    # The Stripe idempotency key the reconciler would use is this same form.
+    assert {:ok, []} = Memory.unrecorded(10, ctx.guard)
+  end
+
   ## R2 and the logger nit: the settle process.
 
   test "the settle task gets 30 s to finish at shutdown, and the request's Logger metadata",
