@@ -22,9 +22,9 @@ defmodule X402.Facilitator do
       facilitator's reason code if it looks like one, else `"unknown"`.
     * `{:error, {:pending, tx_hash}}`: settle returned `settlement_pending`
       (spec 9): broadcast, not confirmed. Not a success.
-    * `{:error, :timeout | :unavailable | {:http_status, status} |
-      :invalid_response | :invalid_config | :req_options_not_allowed |
-      :not_implemented}`: anything else.
+    * `{:error, reason}`: anything else, where `reason` is one of `:timeout`,
+      `:unavailable`, `{:http_status, status}`, `:invalid_response`,
+      `:invalid_config`, `:req_options_not_allowed` or `:not_implemented`.
 
   An adapter should return, not raise; `X402.handle/2` still catches a raise,
   throw or exit from either call and fails closed.

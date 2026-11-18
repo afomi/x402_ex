@@ -8,6 +8,13 @@ Settled payments are recorded in Stripe as machine payments, and a reconciler fi
 
 Every header and field is sourced in [docs/SPEC_NOTES.md](docs/SPEC_NOTES.md); what we could not confirm is marked there.
 
+## Status
+
+v0.1 is ready for sandbox use: Base Sepolia, the x402.org test facilitator and a Stripe sandbox.
+It has not yet carried a live payment.
+Coinbase Developer Platform authentication, needed for mainnet, is not implemented and fails closed.
+The API may change before 1.0, as [CHANGELOG.md](CHANGELOG.md) records.
+
 ## Installation
 
 ```elixir
@@ -262,3 +269,13 @@ mix compile --warnings-as-errors
 
 The tests make no network calls; facilitators and Stripe are stubbed with `Req.Test`.
 A live run against Base Sepolia, the public test facilitator and a Stripe sandbox is still owed before either app goes live.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+Please report vulnerabilities privately, as [SECURITY.md](SECURITY.md) describes.
+
+## License
+
+Copyright 2026 Afomi.
+Licensed under the [Apache License, Version 2.0](LICENSE).
