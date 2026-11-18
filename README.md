@@ -95,6 +95,11 @@ Rate-limit the paid path per client before calling `X402.handle/2`.
 Every well-formed `PAYMENT-SIGNATURE` header costs a facilitator `/verify` call of up to 5 seconds, whether or not its signature is genuine.
 The library does no rate limiting of its own.
 
+## Browser clients
+
+The protocol lives in headers, so a browser client can only read `PAYMENT-RESPONSE` if the server names it in `Access-Control-Expose-Headers` (transports-v2/http.md, "Browser Clients").
+The library sets no CORS headers; add that one in your CORS plug if browsers will pay.
+
 ## Modules
 
 - `X402`: `handle/2`, the whole flow for one request; header names.
@@ -240,6 +245,7 @@ X402.Reconciler.record_unrecorded({MyApp.X402Claims, []}, fn -> stripe_secret_ke
 ```
 
 It is safe to repeat: the idempotency key is the transaction hash, so Stripe returns the same PaymentIntent.
+If a run overlaps a request's own Stripe call for the same hash, Stripe answers the second with a 409 (`idempotency_key_in_use`); that row is reported as failed and the next run finishes it.
 It books only `kind = 'transaction'` rows.
 A `transaction_disputed` row is a settlement whose report contradicted the signed payment: the client was not served, the money may have moved, and it needs a person and a check on chain.
 An `"auth:"` row with no `"tx:"` row whose `auth_key` points to it needs a check on chain first (`X402.Reconciler` docs).

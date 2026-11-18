@@ -5,13 +5,15 @@ Thank you for helping.
 ## Before a pull request
 
 ```bash
-mix deps.get
+mix deps.get --check-locked
 mix format --check-formatted
 mix compile --warnings-as-errors
 mix test
+mix docs --warnings-as-errors
+mix hex.build
 ```
 
-CI runs the same four steps.
+CI runs the same six steps.
 
 ## What we ask
 

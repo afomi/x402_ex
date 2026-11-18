@@ -10,6 +10,9 @@ Sources were read on 2026-11-18 at these commits:
 - Stripe sample: https://github.com/stripe-samples/machine-payments at `e535a061b6fb7184d2167884a91777cf6a65cb41`.
 - Stripe docs: https://docs.stripe.com/payments/machine/x402 and https://docs.stripe.com/payments/machine.
 
+Re-read for the v0.1.1 review, also on 2026-11-18, at https://github.com/x402-foundation/x402 `b00738784bfa78832f5a8caa3834fe1e28273369` (`main`), the Stripe sample at the same commit as above, and `STRIPE_X402` as served that day.
+Where a note below cites the reference code by path, the path is the same in both repositories.
+
 Short names used below:
 
 - `SPEC` = https://github.com/coinbase/x402/blob/0e6e8c55d86b4f14234fb6e49a4052074fb93e57/specs/x402-specification-v2.md
@@ -35,7 +38,8 @@ We read and write them lowercased (`payment-signature`, `payment-required`, `pay
 Encoding: "Base64-encoded" JSON (`HTTP`).
 The spec's own examples use the standard alphabet with `=` padding (the `PAYMENT-SIGNATURE` example ends in `fX0=`), and the reference client encodes with `btoa` or `Buffer.toString("base64")`, both standard and padded (`typescript/packages/core/src/utils/index.ts`, `safeBase64Encode`).
 We encode standard and padded, and decode standard padded or unpadded.
-**UNCONFIRMED:** whether any client sends URL-safe base64; we refuse it (`:invalid_base64`).
+URL-safe base64 is refused (`:invalid_base64`), as the reference does: its `Base64EncodedRegex` is `/^[A-Za-z0-9+/]*={0,2}$/` (same file), which admits neither `-` nor `_`.
+The reference encodes the JSON as UTF-8 before base64 (`TextEncoder`, or `Buffer.from(data, "utf8")`) and decodes it back as UTF-8, so a non-ASCII `description` round-trips; we encode UTF-8 too (`Jason.encode!/1`).
 
 The 402 status: `HTTP`, "Payment Required Signaling": "HTTP 402 status code with `PAYMENT-REQUIRED` header".
 Status mapping (`HTTP`, "Error Handling"): Payment Required 402, Invalid Payment 400 ("Malformed payment payload or requirements"), Payment Failed 402, Server Error 500, Success 200.
@@ -66,6 +70,9 @@ The reference client always sends it: `typescript/packages/core/src/client/x402C
 The reference server's rule (`typescript/packages/core/src/server/x402ResourceServer.ts`, `paymentRequirementsMatchAccepted`): "Core payment terms and all server-declared `extra` fields must match exactly, but clients may include additive scheme-specific metadata under `accepted.extra`."
 It compares the core fields with `deepEqual` and `extra` with `objectContainsSubset`.
 We do the same, field by field, so each refusal has its own reason.
+The reference server never reads the payload's `resource` when matching (`findMatchingRequirements`); our `resource.url` check is our own rule, stricter than the reference, and the reference client always sends the field.
+
+What goes to the facilitator is the server's own `PaymentRequirements`, never the client's `accepted` (`verifyPayment` and `settleWithPendingRetry` in the same file); we do the same (`X402.Facilitator.request/2`), so a client cannot add keys to what the facilitator checks.
 
 Addresses: the spec does not state a case rule.
 The reference EVM facilitator normalises with viem's `getAddress` before comparing (`typescript/packages/mechanisms/evm/src/exact/facilitator/eip3009.ts`: `getAddress(eip3009Payload.authorization.to) !== getAddress(requirements.payTo)`), which makes the comparison case-insensitive.
@@ -79,6 +86,18 @@ So on `eip155:*` we compare `asset`, `payTo` and `authorization.to` case-insensi
 `extra.name` and `extra.version` are required (the token's EIP-712 domain).
 `extra.assetTransferMethod` is optional and "if present, MUST be `\"eip3009\"`"; clients "should default to `\"eip3009\"`" when it is absent.
 We refuse `permit2` and ERC-7710 in v0.1.
+
+Amount: `EVM` Phase 2 says only that the "Amount" must "meet the `PaymentRequirements`".
+The reference facilitator is strict: `BigInt(eip3009Payload.authorization.value) !== BigInt(requirements.amount)` is `invalid_exact_evm_payload_authorization_value` (`typescript/packages/mechanisms/evm/src/exact/facilitator/eip3009.ts`).
+We require `authorization.value` to equal the offer's amount as a string, which is the same for every value the reference client sends (it copies `amount` verbatim); a numerically equal spelling such as `"010000"` is refused by us and would pass the reference.
+
+Validity window, same file: `validBefore < now + 6` is expired (a six-second buffer for block time) and `validAfter > now` is not yet valid.
+We do not check the window; the facilitator's `/verify` does.
+
+Signature: `EVM` says "the 65-byte signature".
+The reference facilitator has no length check; it hashes the typed data and verifies with ecrecover for an account without code, strict EIP-1271 for one with code, and ERC-6492 for a counterfactual account whose factory is allow-listed, and it rejects a non-canonical ECDSA `s`.
+We require at least 65 bytes of hex before the facilitator is asked.
+**UNCONFIRMED:** whether any client sends a 64-byte compact (EIP-2098) signature; we would refuse it as `:invalid_payload`.
 
 USDC addresses and domains, from `typescript/packages/mechanisms/evm/src/defaultAssets.ts`:
 
@@ -98,13 +117,16 @@ Response: `VerifyResponse` (`SPEC` 5.4.2): `isValid` (required), `invalidReason`
 `/verify` "is **read-only**".
 
 `/settle`: `SPEC` 7.2, same request body.
-Response: `SettleResponse` (`SPEC` 5.3.2): `success`, `errorReason`, `payer`, `transaction` (required; "empty string if no transaction was broadcast"), `network` (required), `amount` (optional).
+Response: `SettleResponse` (`SPEC` 5.3.2): `success`, `errorReason`, `payer`, `transaction` (required; "empty string if no transaction was broadcast"), `network` (required), `amount` (optional, "the actual amount settled in atomic units").
+The reference EVM facilitator does not return `amount`; when one is present we require it to equal the offer's.
 
 `settlement_pending` (`SPEC` 9): "broadcast but its confirmation could not be established"; "**non-terminal**"; carries a non-empty `transaction`.
 We treat it as not settled, keep the payment claimed and log the hash.
+The reference server instead retries `/settle` once with the same payload (`settleWithPendingRetry`, `x402ResourceServer.ts`), and the reference facilitator keeps a store keyed by the signature so the retry reconciles against the hash it already broadcast.
+Our refusal means the client signs a new authorization while the first may still confirm; see the CHANGELOG and the open proposal to retry once.
 
-Non-2xx handling follows the reference client (`typescript/packages/core/src/http/httpFacilitatorClient.ts`): a non-2xx body with `isValid` (or `success`) is a verdict; anything else is an error.
-The reference follows redirects (`redirect: "follow"`); we do not.
+Non-2xx handling follows the reference client (`typescript/packages/core/src/http/httpFacilitatorClient.ts`): a non-2xx body with `isValid` (or `success`) is raised as a structured `VerifyError` or `SettleError` carrying that body, that is, a verdict; anything else is a plain error.
+The reference follows redirects (`redirect: "follow"`) and waits up to 90 seconds (`DEFAULT_TIMEOUT_MS`); we follow none and wait 5 seconds for `/verify` and 15 for `/settle` by default.
 
 ## Facilitators
 
@@ -144,6 +166,7 @@ We send it as `POST https://api.stripe.com/v1/payment_intents`, form-encoded, wi
 `amount`, `currency=usd`, `confirm=true`, `payment_method_data[type]=crypto`, `allowed_payment_method_types[0]=crypto`, `payment_method_options[crypto][mode]=transaction_verification`, `payment_method_options[crypto][transaction_verification_options][network]=base`, `payment_method_options[crypto][transaction_verification_options][transaction_hash]=<tx>`.
 Headers: `Authorization: Bearer <secret key>`, `Stripe-Version`, `Idempotency-Key: <tx hash>`.
 The bracketed form keys and the `[0]` array index are how Stripe's server SDKs encode nested params; **UNCONFIRMED** against a live Stripe call in this repo.
+Re-checked on 2026-11-18: `STRIPE_X402` "Create a PaymentIntent" still shows exactly these parameters and `{ idempotencyKey: txHash }`, and its "Token and network support" table now also lists USDC on Tempo and Solana, which this library does not offer.
 
 The parameter is `allowed_payment_method_types`, not `payment_method_types`: that is what the sample and the docs use.
 `payment_method_data[type]=crypto` and `confirm=true` are also in both.
