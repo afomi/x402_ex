@@ -12,4 +12,17 @@ defmodule X402.Safe do
   catch
     kind, _reason -> {:caught, kind}
   end
+
+  # A reason from an adapter, a guard or the app, as a short token safe to
+  # log: an atom, or the tag of a small tuple. Never the whole term, which
+  # might carry a request, a row or a secret.
+  @spec reason(term()) :: String.t()
+  def reason(why) when is_atom(why), do: Atom.to_string(why)
+  def reason({tag, n}) when is_atom(tag) and is_integer(n), do: "#{tag}_#{n}"
+  def reason({:caught, kind}) when is_atom(kind), do: "caught_#{kind}"
+
+  def reason(tuple) when is_tuple(tuple) and is_atom(elem(tuple, 0)),
+    do: Atom.to_string(elem(tuple, 0))
+
+  def reason(_), do: "other"
 end

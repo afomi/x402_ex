@@ -66,6 +66,11 @@ Pass secrets (the Stripe key, the CDP secret) as 0-arity functions, so they neve
 
 `X402.handle/2`'s module docs explain the order of the steps, why the payment is claimed before it is settled, and what happens after the money moves.
 
+A 503 after the settle wait (`:settle_await_ms`, 40 seconds by default) may still mean "paid".
+The settlement carries on after the request gives up, and its `"tx:"` row and the reconciler record it.
+The client's retry with the same header is refused as replayed, so it signs a new payment; it is never charged twice for one authorization.
+A settle in flight also gets 30 seconds to finish when the app shuts down, so a deploy does not cut it short.
+
 ## One deposit address per app
 
 The exactly-once boundary is one app's guard table.
@@ -113,8 +118,11 @@ defmodule MyApp.Repo.Migrations.CreateX402Claims do
     create table(:x402_claims) do
       # "auth:<payment id>" before settling, "tx:<network>:<tx hash>" after.
       add :key, :text, null: false
-      # "authorization" or "transaction".
+      # "authorization", "transaction", or "transaction_disputed" (a settle that
+      # reported success but contradicted the signed payment; see :dispute).
       add :kind, :text, null: false
+      # On "transaction_disputed" rows: "payer_mismatch" or "amount_mismatch".
+      add :dispute, :text
       # The app this claim belongs to (the :scope app name).
       add :app, :text, null: false
       add :network, :text, null: false
@@ -169,6 +177,7 @@ defmodule MyApp.X402Claims do
       resource: meta.resource,
       tx_hash: meta.tx_hash,
       auth_key: meta.auth_key,
+      dispute: meta.dispute && Atom.to_string(meta.dispute),
       inserted_at: DateTime.utc_now()
     }
 
@@ -224,6 +233,8 @@ X402.Reconciler.record_unrecorded({MyApp.X402Claims, []}, fn -> stripe_secret_ke
 ```
 
 It is safe to repeat: the idempotency key is the transaction hash, so Stripe returns the same PaymentIntent.
+It books only `kind = 'transaction'` rows.
+A `transaction_disputed` row is a settlement whose report contradicted the signed payment: the client was not served, the money may have moved, and it needs a person and a check on chain.
 An `"auth:"` row with no `"tx:"` row whose `auth_key` points to it needs a check on chain first (`X402.Reconciler` docs).
 
 ## Configuration

@@ -47,6 +47,15 @@ defmodule X402 do
   Steps 5 to 7 run in a process under `X402.TaskSupervisor`, not linked to
   the request, which waits for it. A client that disconnects mid-settle
   kills its request process; the settlement and its record still complete.
+  The process carries the request's Logger metadata, and gets 30 seconds to
+  finish when the app shuts down, so a deploy does not cut a settle short.
+
+  A request that waits longer than `:settle_await_ms` gets
+  `{:error, :facilitator_unavailable}` (answer 503), while the work carries
+  on. That 503 may still mean "paid": the settlement can complete and be
+  recorded after the client has gone. The `"tx:"` row and
+  `X402.Reconciler` cover it; the client's retry with the same header is
+  refused as `:replayed`, and it signs a new payment.
 
   ## Why claim before settle
 
@@ -85,14 +94,20 @@ defmodule X402 do
 
   ## After the money moves
 
-  Once `/settle` succeeds, no failure leaves the payment unrecorded or
-  unserved:
+  Once `/settle` succeeds, no failure leaves the payment unrecorded, and
+  only a report we cannot believe leaves it unserved:
 
     * a guard error on the `"tx:"` claim (not `:replayed`) still serves the
       client, and logs `outcome=tx_claim_failed` with the hash at error level;
     * an `on_settled` that returns an error, raises, throws or exits is
       logged; the client, who has paid, still gets `{:ok, ...}`, and the row
-      stays without a PaymentIntent for `X402.Reconciler` to record.
+      stays without a PaymentIntent for `X402.Reconciler` to record;
+    * a success whose `payer` or `amount` contradicts the signed payment is
+      not served (`{:error, :facilitator_unavailable}`), but its `"tx:"` row
+      is written with `kind: :transaction_disputed` and `dispute:
+      :payer_mismatch | :amount_mismatch`, and logged as
+      `outcome=settle_inconsistent`. The reconciler does not book it to
+      Stripe; it needs a person and a check on chain.
 
   Before it succeeds, a facilitator adapter that raises, throws or exits is
   treated as the facilitator being unavailable, and fails closed.
@@ -141,6 +156,13 @@ defmodule X402 do
   @payment_header "payment-signature"
   @challenge_header "payment-required"
   @response_header "payment-response"
+
+  # How long a settle in flight gets to finish when the app shuts down (a
+  # deploy): a settle may take 15 s and the Stripe record up to 12 s more.
+  @settle_shutdown_ms 30_000
+
+  @doc false
+  def settle_shutdown_ms, do: @settle_shutdown_ms
 
   @decode_reasons [
     :header_too_large,
@@ -336,10 +358,18 @@ defmodule X402 do
   # Settle, record and call on_settled in a process that outlives the
   # request, and wait for it.
   defp settle_and_record(ctx, request, payment, auth_key) do
+    # The request's Logger metadata (request_id and the like) follows the work.
+    metadata = Logger.metadata()
+
     task =
-      Task.Supervisor.async_nolink(X402.TaskSupervisor, fn ->
-        settle(ctx, request, payment, auth_key)
-      end)
+      Task.Supervisor.async_nolink(
+        X402.TaskSupervisor,
+        fn ->
+          Logger.metadata(metadata)
+          settle(ctx, request, payment, auth_key)
+        end,
+        shutdown: @settle_shutdown_ms
+      )
 
     case Task.yield(task, ctx.await_ms) do
       {:ok, result} ->
@@ -366,9 +396,13 @@ defmodule X402 do
   defp settle(%{facilitator: {module, config}} = ctx, request, payment, auth_key) do
     case Safe.call(fn -> module.settle(request, config) end) do
       {:ok, {:ok, %Settlement{} = s}} ->
-        with :ok <- consistent(ctx, s, payment) do
-          s = %{s | payer: payment.payer, payment_id: payment.payment_id}
-          record(ctx, s, payment, auth_key)
+        case consistent(ctx, s, payment) do
+          :ok ->
+            s = %{s | payer: payment.payer, payment_id: payment.payment_id}
+            record(ctx, s, payment, auth_key)
+
+          {:mismatch, reason} ->
+            dispute(ctx, s, payment, auth_key, reason)
         end
 
       {:ok, {:error, {:rejected, why}}} ->
@@ -394,24 +428,45 @@ defmodule X402 do
   defp consistent(ctx, s, payment) do
     cond do
       s.amount != nil and s.amount != ctx.offer.amount ->
-        Logger.error(
-          log("settle_inconsistent", payment.payer, s.transaction) <>
-            " reason=amount_mismatch reconcile=on_chain"
-        )
-
-        {:error, :facilitator_unavailable}
+        {:mismatch, :amount_mismatch}
 
       s.payer != nil and not same_payer?(ctx.offer, s.payer, payment.payer) ->
-        Logger.error(
-          log("settle_inconsistent", payment.payer, s.transaction) <>
-            " reason=payer_mismatch reconcile=on_chain"
-        )
-
-        {:error, :facilitator_unavailable}
+        {:mismatch, :payer_mismatch}
 
       true ->
         :ok
     end
+  end
+
+  # /settle said success, but its report contradicts the signed payment. The
+  # money may have moved, so write a flagged "tx:" row for ops and the
+  # reconciler to see (it is not booked to Stripe: we don't believe its
+  # amount), and serve nothing.
+  defp dispute(%{guard: {module, config}} = ctx, s, payment, auth_key, reason) do
+    tx = String.downcase(s.transaction)
+
+    written =
+      with {:ok, scheme} <- Scheme.for(ctx.offer.scheme, ctx.offer.network),
+           true <- scheme.valid_transaction?(tx) do
+        meta =
+          ctx
+          |> meta(:transaction_disputed, payment)
+          |> Map.merge(%{tx_hash: tx, auth_key: auth_key, dispute: reason})
+
+        case Safe.call(fn -> module.claim("tx:" <> s.network <> ":" <> tx, meta, config) end) do
+          {:ok, :ok} -> "true"
+          _ -> "false"
+        end
+      else
+        _ -> "false"
+      end
+
+    Logger.error(
+      log("settle_inconsistent", payment.payer, code(tx)) <>
+        " reason=#{reason} disputed_row=#{written} reconcile=on_chain"
+    )
+
+    {:error, :facilitator_unavailable}
   end
 
   defp same_payer?(offer, a, b) do
@@ -490,7 +545,8 @@ defmodule X402 do
       amount: ctx.offer.amount,
       resource: ctx.offer.resource,
       tx_hash: nil,
-      auth_key: nil
+      auth_key: nil,
+      dispute: nil
     }
   end
 
@@ -521,12 +577,7 @@ defmodule X402 do
     "x402 outcome=#{outcome} payer=#{payer || "-"} tx_hash=#{tx_hash || "-"}"
   end
 
-  # Reasons come from adapters as atoms or small tuples; never print a
-  # structure that might carry a request.
-  defp short(why) when is_atom(why), do: Atom.to_string(why)
-  defp short({tag, n}) when is_atom(tag) and is_integer(n), do: "#{tag}_#{n}"
-  defp short({tag, _}) when is_atom(tag), do: Atom.to_string(tag)
-  defp short(_), do: "other"
+  defp short(why), do: Safe.reason(why)
 
   # A facilitator adapter's reason or hash, printed only if it is a plain token.
   defp code(s) when is_binary(s),

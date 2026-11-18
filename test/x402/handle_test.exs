@@ -589,6 +589,38 @@ defmodule X402.HandleTest do
              {:ok, %{recorded: [], failed: []}}
   end
 
+  defmodule LeakyGuard do
+    @moduledoc false
+    @behaviour X402.ReplayGuard
+    @impl true
+    def claim(key, meta, agent), do: Memory.claim(key, meta, agent)
+    @impl true
+    def record_payment_intent(_key, _id, _agent),
+      do: {:error, {:db_error, "postgres://app:hunter2@db/prod"}}
+
+    @impl true
+    def unrecorded(limit, agent), do: Memory.unrecorded(limit, agent)
+  end
+
+  test "the reconciler logs a guard error by its tag only", ctx do
+    opts = Keyword.put(ctx.opts, :on_settled, fn _ -> {:error, :stripe_unavailable} end)
+    assert {:ok, _, _} = handle(ctx.header, opts)
+
+    stub(&Req.Test.json(&1, %{"id" => "pi_ok"}))
+
+    {result, log} =
+      with_log(fn ->
+        X402.Reconciler.record_unrecorded({LeakyGuard, ctx.guard}, "sk_test_x",
+          stripe_opts: [req_options: [plug: {Req.Test, __MODULE__}]]
+        )
+      end)
+
+    assert {:ok, %{recorded: [], failed: [{_, _}]}} = result
+    assert log =~ "outcome=reconcile_failed"
+    assert log =~ "reason=db_error"
+    refute log =~ "hunter2"
+  end
+
   test "the reconciler reports a Stripe failure and leaves the row", ctx do
     opts = Keyword.put(ctx.opts, :on_settled, fn _ -> {:error, :stripe_unavailable} end)
     assert {:ok, _, _} = handle(ctx.header, opts)
@@ -624,7 +656,21 @@ defmodule X402.HandleTest do
 
     {result, log} = with_log(fn -> X402.handle(conn(ctx.header), ctx.opts) end)
     assert result == {:error, :facilitator_unavailable}
-    assert log =~ "reason=payer_mismatch"
+    assert log =~ "outcome=settle_inconsistent"
+    assert log =~ "reason=payer_mismatch disputed_row=true"
+
+    # R1: the money may have moved, so a flagged row records it, and the
+    # reconciler does not book it.
+    assert %{
+             kind: :transaction_disputed,
+             dispute: :payer_mismatch,
+             tx_hash: tx,
+             auth_key: "auth:" <> _
+           } =
+             Memory.claims(ctx.guard)["tx:eip155:84532:" <> Fixtures.tx()]
+
+    assert tx == Fixtures.tx()
+    assert Memory.unrecorded(10, ctx.guard) == {:ok, []}
   end
 
   test "a settle reporting another amount fails closed", ctx do
@@ -635,7 +681,47 @@ defmodule X402.HandleTest do
       end
     end)
 
-    assert handle(ctx.header, ctx.opts) == {:error, :facilitator_unavailable}
+    test = self()
+    opts = Keyword.put(ctx.opts, :on_settled, fn _ -> send(test, :on_settled) end)
+
+    assert handle(ctx.header, opts) == {:error, :facilitator_unavailable}
+    refute_received :on_settled
+
+    assert %{kind: :transaction_disputed, dispute: :amount_mismatch} =
+             Memory.claims(ctx.guard)["tx:eip155:84532:" <> Fixtures.tx()]
+
+    # The same header again is refused before any settle.
+    assert {:payment_required, _, :replayed} = handle(ctx.header, ctx.opts)
+  end
+
+  ## R2 and the logger nit: the settle process.
+
+  test "the settle task gets 30 s to finish at shutdown, and the request's Logger metadata",
+       ctx do
+    test = self()
+
+    settle = fn request ->
+      send(test, {:settling, self(), Logger.metadata()})
+
+      receive do
+        :go -> settled_ok(request)
+      end
+    end
+
+    task =
+      Task.async(fn ->
+        Logger.metadata(request_id: "req-abc123")
+        X402.handle(conn(ctx.header), fun_opts(ctx, settle))
+      end)
+
+    assert_receive {:settling, settle_pid, metadata}
+    assert metadata[:request_id] == "req-abc123"
+
+    assert {_mfa, :temporary, 30_000, :worker, _} =
+             :sys.get_state(X402.TaskSupervisor).children[settle_pid]
+
+    send(settle_pid, :go)
+    assert {:ok, _, _} = Task.await(task)
   end
 
   test "a verify reporting another payer fails closed, with nothing claimed", ctx do

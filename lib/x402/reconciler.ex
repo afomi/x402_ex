@@ -15,6 +15,10 @@ defmodule X402.Reconciler do
   PaymentIntent. Stripe keeps idempotency keys for 24 hours, so run it well
   within the day.
 
+  Rows with `kind: :transaction_disputed` (a settle whose report
+  contradicted the signed payment) are not booked: `unrecorded/2` returns
+  only `:transaction` rows. Check those on chain by hand.
+
   ## What it does not cover
 
   An `"auth:"` row with no matching `"tx:"` row is an authorization that was
@@ -22,7 +26,9 @@ defmodule X402.Reconciler do
   a settle that failed, timed out or came back `settlement_pending`. Most
   moved no money. To be sure, check the chain: on EVM, the token contract's
   `authorizationState(from, nonce)` is true, or an `AuthorizationUsed(from,
-  nonce)` event was emitted, if the authorization was used. This library has
+  nonce)` event was emitted, if the authorization was used. A deploy that
+  stops the app mid-settle can also leave one, though settle tasks get 30
+  seconds to finish at shutdown. This library has
   no chain client, so that check is the app's.
   """
 
@@ -67,7 +73,11 @@ defmodule X402.Reconciler do
     else
       other ->
         reason = failure(other)
-        Logger.error("x402 outcome=reconcile_failed tx_hash=#{tx} reason=#{inspect(reason)}")
+
+        Logger.error(
+          "x402 outcome=reconcile_failed tx_hash=#{tx} reason=#{X402.Safe.reason(reason)}"
+        )
+
         %{acc | failed: [{tx, reason} | acc.failed]}
     end
   end

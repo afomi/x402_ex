@@ -15,7 +15,9 @@ defmodule X402.ReplayGuard do
     * `"tx:" <> network <> ":" <> tx_hash` right after settling, before
       anything else runs. This row is the durable record of the settlement.
 
-  `meta` is a map with `:kind` (`:authorization` or `:transaction`), `:app`,
+  `meta` is a map with `:kind` (`:authorization`, `:transaction`, or
+  `:transaction_disputed` for a settlement whose report contradicted the
+  signed payment, with `:dispute` naming why), `:app`,
   `:network`, `:asset`, `:pay_to`, `:payer`, `:amount`, `:resource`, and
   for `:transaction` also `:tx_hash` and `:auth_key` (the `"auth:"` key it
   settled). Claims are never released: a payment whose settlement failed
@@ -23,7 +25,7 @@ defmodule X402.ReplayGuard do
 
   `record_payment_intent(tx_key, payment_intent_id, config)` stores the
   Stripe PaymentIntent id on the `"tx:"` row once it is recorded.
-  `unrecorded(limit, config)` lists `"tx:"` rows that have none yet, oldest
+  `unrecorded(limit, config)` lists `:transaction` rows (not disputed ones) that have none yet, oldest
   first, as maps with `:key`, `:tx_hash`, `:network`, `:asset` and
   `:amount`; `X402.Reconciler` records them.
 
@@ -36,7 +38,7 @@ defmodule X402.ReplayGuard do
   `X402.ReplayGuard.Memory` is for tests. See the README for an Ecto version.
   """
 
-  @type kind :: :authorization | :transaction
+  @type kind :: :authorization | :transaction | :transaction_disputed
 
   @type unrecorded_row :: %{
           key: String.t(),
