@@ -3,7 +3,7 @@
 This project follows [Semantic Versioning](https://semver.org).
 Before 1.0, a minor version may change the API; each change is listed here.
 
-## Unreleased
+## v0.1.1 (2026-11-19)
 
 - `X402.handle/2` checks every settlement an adapter returns before serving, not only `X402.Facilitator.HTTP`'s: the transaction hash must be well formed for the scheme and the network must be the offer's.
   One that is not is not served (`{:error, :facilitator_unavailable}`), and is logged as `outcome=settle_unavailable` with `reason=invalid_transaction` or `reason=settlement_network_mismatch` and `reconcile=check_payer_on_chain`.
@@ -11,7 +11,7 @@ Before 1.0, a minor version may change the API; each change is listed here.
 - CI also checks the lockfile (`mix deps.get --check-locked`), builds the docs with warnings as errors and builds the Hex package; `CONTRIBUTING.md` ships in the package.
 - `docs/SPEC_NOTES.md` re-read against the x402 Foundation repository: standard base64 only and strict `value == amount` are confirmed from the reference code, and the reference server's retry of `settlement_pending` is noted.
 - README: browser clients need `PAYMENT-RESPONSE` in `Access-Control-Expose-Headers`; a reconciler run that overlaps a request's Stripe call gets a 409 and finishes next time.
-- CI tests Elixir 1.19 only, and the minimum is Elixir 1.18 (was 1.15), the oldest version in use.
+- Elixir 1.18 minimum (was 1.15), tested on 1.19; CI runs 1.19 only.
 
 ## v0.1.0 (2026-11-18)
 
