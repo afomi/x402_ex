@@ -3,6 +3,18 @@
 This project follows [Semantic Versioning](https://semver.org).
 Before 1.0, a minor version may change the API; each change is listed here.
 
+## Unreleased
+
+- `X402.handle/2` retries `/settle` once after `settlement_pending`, with the same request body, inside the same settle task and under the same `"auth:"` claim, as the reference server does; the chain spends an EIP-3009 nonce once, so the money cannot move twice.
+  The retry gets what is left of the first call's `:settle_timeout` (floor 5 s), so settle, retry and the Stripe record fit `:settle_await_ms`.
+  Only a success naming the pending hash is served.
+  Another hash writes a `transaction_disputed` row keyed on the pending hash with `dispute: :pending_hash_changed`, logged `outcome=pending_hash_changed` with both hashes, and serves nothing.
+  A second pending answer, or a refusal after the broadcast, is refused as `:settlement_pending` with the hash logged; a retry that times out, crashes or cannot be read fails closed as `outcome=settle_retry_unavailable`.
+  A pending answer with no well-formed hash is not retried.
+  Before, one pending answer was refused outright and the client signed a second authorization while the first could still confirm.
+- `X402.ReplayGuard.Memory` refuses every call with `{:error, :memory_guard_not_allowed}` unless `config :x402_ex, allow_memory_guard: true` is set, which belongs in `config/test.exs` only, so a copied test config cannot ship a guard that forgets on restart; `X402.handle/2` then fails closed before any settle.
+- `X402.Facilitator.HTTP.default_settle_timeout/0` names the 15 s default.
+
 ## v0.1.1 (2026-11-19)
 
 - `X402.handle/2` checks every settlement an adapter returns before serving, not only `X402.Facilitator.HTTP`'s: the transaction hash must be well formed for the scheme and the network must be the offer's.

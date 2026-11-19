@@ -32,9 +32,18 @@ defmodule X402.Facilitator.HTTP do
     end
   end
 
+  @default_settle_timeout 15_000
+
+  @doc """
+  The default `:settle_timeout`, 15,000 ms, which also sets the budget the
+  one retry after `settlement_pending` is given (`X402.handle/2`).
+  """
+  def default_settle_timeout, do: @default_settle_timeout
+
   @doc false
   def settle(request, config) do
-    with {:ok, status, body} <- post(config, "/settle", request, :settle_timeout, 15_000) do
+    with {:ok, status, body} <-
+           post(config, "/settle", request, :settle_timeout, @default_settle_timeout) do
       parse_settle(status, body, request)
     end
   end

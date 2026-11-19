@@ -851,6 +851,245 @@ defmodule X402.HandleTest do
     refute Exception.message(error) =~ "s3cret"
   end
 
+  ## One retry of /settle after settlement_pending.
+
+  defmodule ConfigFacilitator do
+    @moduledoc false
+    @behaviour X402.Facilitator
+    @impl true
+    def verify(_request, _config), do: {:ok, %{payer: X402.Fixtures.payer()}}
+    @impl true
+    def settle(request, config), do: config[:settle].(request, config)
+  end
+
+  # A facilitator whose settle answers settlement_pending with the fixture
+  # hash on its first call and `then_fun.(request)` on its second, telling
+  # the test about every call. `extra` may carry `:config` for the adapter
+  # (a :settle_timeout, say), `:first_takes_ms` (how long the pending answer
+  # takes) and any handle/2 options.
+  defp pending_then(ctx, then_fun, extra \\ []) do
+    test = self()
+    calls = :counters.new(1, [])
+    first_takes_ms = Keyword.get(extra, :first_takes_ms, 0)
+
+    settle = fn request, config ->
+      :counters.add(calls, 1, 1)
+      n = :counters.get(calls, 1)
+      send(test, {:settle, n, request, config})
+
+      case n do
+        1 ->
+          Process.sleep(first_takes_ms)
+          {:error, {:pending, Fixtures.tx()}}
+
+        _ ->
+          then_fun.(request)
+      end
+    end
+
+    config = Keyword.put(Keyword.get(extra, :config, []), :settle, settle)
+
+    opts =
+      [facilitator: {ConfigFacilitator, config}] ++
+        Keyword.drop(extra, [:config, :first_takes_ms])
+
+    Keyword.merge(ctx.opts, opts)
+  end
+
+  test "pending, then success with the same hash: served once, one tx row, the same request body",
+       ctx do
+    test = self()
+
+    opts =
+      pending_then(ctx, &settled_ok/1,
+        on_settled: fn _ -> send(test, :on_settled) && {:ok, "pi_retry"} end
+      )
+
+    {result, log} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+
+    assert {:ok, _conn, %Settlement{transaction: tx}} = result
+    assert tx == Fixtures.tx()
+    assert log =~ "outcome=paid"
+
+    assert_received {:settle, 1, request, _}
+    assert_received {:settle, 2, ^request, _}
+    refute_received {:settle, 3, _, _}
+    assert_received :on_settled
+    refute_received :on_settled
+
+    claims = Memory.claims(ctx.guard)
+    assert Enum.count(claims) == 2
+
+    assert %{kind: :transaction, tx_hash: ^tx, payment_intent_id: "pi_retry"} =
+             claims["tx:eip155:84532:" <> Fixtures.tx()]
+  end
+
+  test "pending, then success with a new hash: a disputed row on the pending hash, not served, nothing to Stripe",
+       ctx do
+    other = "0x" <> String.duplicate("e", 64)
+    test = self()
+
+    opts =
+      pending_then(
+        ctx,
+        fn _ -> {:ok, %Settlement{transaction: other, network: "eip155:84532"}} end,
+        on_settled: fn _ -> send(test, :on_settled) end
+      )
+
+    {result, log} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+
+    assert result == {:error, :facilitator_unavailable}
+    refute_received :on_settled
+    assert log =~ "outcome=pending_hash_changed"
+    assert log =~ "tx_hash=#{Fixtures.tx()} retry_tx_hash=#{other}"
+    assert log =~ "reason=pending_hash_changed disputed_row=true"
+
+    claims = Memory.claims(ctx.guard)
+
+    assert %{kind: :transaction_disputed, dispute: :pending_hash_changed, tx_hash: tx} =
+             claims["tx:eip155:84532:" <> Fixtures.tx()]
+
+    assert tx == Fixtures.tx()
+    refute Map.has_key?(claims, "tx:eip155:84532:" <> other)
+    assert Memory.unrecorded(10, ctx.guard) == {:ok, []}
+
+    # The same header again is refused before any settle.
+    assert {:payment_required, _, :replayed} = handle(ctx.header, ctx.opts)
+  end
+
+  test "pending, then pending again: refused with the hash logged, and no third call", ctx do
+    opts = pending_then(ctx, fn _ -> {:error, {:pending, Fixtures.tx()}} end)
+
+    {result, log} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+
+    assert {:payment_required, _, :settlement_pending} = result
+    assert log =~ "outcome=settlement_pending"
+    assert log =~ "tx_hash=#{Fixtures.tx()} retry=pending"
+    assert log =~ "reconcile=on_chain"
+    assert_received {:settle, 2, _, _}
+    refute_received {:settle, 3, _, _}
+    assert [auth_key] = Map.keys(Memory.claims(ctx.guard))
+    assert String.starts_with?(auth_key, "auth:")
+  end
+
+  test "pending, then a refusal: refused as pending, since the broadcast is not undone", ctx do
+    opts = pending_then(ctx, fn _ -> {:error, {:rejected, "invalid_transaction_state"}} end)
+
+    {result, log} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+
+    assert {:payment_required, _, :settlement_pending} = result
+    assert log =~ "tx_hash=#{Fixtures.tx()} retry=rejected reason=invalid_transaction_state"
+    refute log =~ "outcome=settlement_failed"
+  end
+
+  for {kind, fun} <- [
+        raise: quote(do: fn _ -> raise "finch exploded" end),
+        exit: quote(do: fn _ -> exit(:killed) end),
+        timeout: quote(do: fn _ -> {:error, :timeout} end),
+        unreadable: quote(do: fn _ -> {:error, :invalid_response} end)
+      ] do
+    test "pending, then a retry that #{kind}s: fails closed with the reconcile line", ctx do
+      test = self()
+
+      opts =
+        pending_then(ctx, unquote(fun), on_settled: fn _ -> send(test, :on_settled) end)
+
+      {result, log} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+
+      assert result == {:error, :facilitator_unavailable}
+      assert log =~ "outcome=settle_retry_unavailable"
+      assert log =~ "tx_hash=#{Fixtures.tx()}"
+      assert log =~ "reconcile=on_chain"
+      refute_received :on_settled
+      assert [auth_key] = Map.keys(Memory.claims(ctx.guard))
+      assert String.starts_with?(auth_key, "auth:")
+    end
+  end
+
+  test "the retry gets what is left of the settle budget, never under 5 s", ctx do
+    # The default budget, less the time the first call took.
+    opts = pending_then(ctx, &settled_ok/1, first_takes_ms: 50)
+    {result, _} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+    assert {:ok, _, _} = result
+    assert_received {:settle, 1, _, first_config}
+    assert_received {:settle, 2, _, retry_config}
+    refute Keyword.has_key?(first_config, :settle_timeout)
+    assert retry_config[:settle_timeout] in 5_000..14_999
+
+    # A small budget already spent: the floor.
+    {:ok, guard} = Memory.start_link()
+    ctx = %{ctx | guard: guard, opts: Keyword.put(ctx.opts, :replay_guard, {Memory, guard})}
+    opts = pending_then(ctx, &settled_ok/1, config: [settle_timeout: 100])
+    {result, _} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+    assert {:ok, _, _} = result
+    assert_received {:settle, 1, _, first_config}
+    assert_received {:settle, 2, _, retry_config}
+    assert first_config[:settle_timeout] == 100
+    assert retry_config[:settle_timeout] == 5_000
+  end
+
+  test "a pending answer whose hash is not well formed is not retried", ctx do
+    test = self()
+
+    settle = fn _request, _config ->
+      send(test, :settle)
+      {:error, {:pending, "0xnot"}}
+    end
+
+    opts = Keyword.put(ctx.opts, :facilitator, {ConfigFacilitator, settle: settle})
+    {result, log} = with_log(fn -> X402.handle(conn(ctx.header), opts) end)
+
+    assert {:payment_required, _, :settlement_pending} = result
+    assert log =~ "outcome=settlement_pending"
+    assert_received :settle
+    refute_received :settle
+  end
+
+  test "a pending answer with no hash is not retried", ctx do
+    test = self()
+
+    stub(fn conn ->
+      send(test, {:facilitator, conn.request_path})
+
+      case conn.request_path do
+        "/facilitator/verify" ->
+          Req.Test.json(conn, Fixtures.verify_ok())
+
+        "/facilitator/settle" ->
+          Req.Test.json(conn, %{
+            "success" => false,
+            "errorReason" => "settlement_pending",
+            "transaction" => "",
+            "network" => "eip155:84532"
+          })
+      end
+    end)
+
+    assert {:payment_required, _, :settlement_failed} = handle(ctx.header, ctx.opts)
+    assert_received {:facilitator, "/facilitator/settle"}
+    refute_received {:facilitator, "/facilitator/settle"}
+  end
+
+  test "concurrent retries of one payment with a pending first answer: one settle chain", ctx do
+    opts = pending_then(ctx, &settled_ok/1)
+
+    {results, _} =
+      with_log(fn ->
+        1..25
+        |> Task.async_stream(fn _ -> X402.handle(conn(ctx.header), opts) end,
+          max_concurrency: 25
+        )
+        |> Enum.map(fn {:ok, r} -> r end)
+      end)
+
+    assert Enum.count(results, &match?({:ok, _, _}, &1)) == 1
+    assert Enum.count(results, &match?({:payment_required, _, :replayed}, &1)) == 24
+    assert_received {:settle, 1, _, _}
+    assert_received {:settle, 2, _, _}
+    refute_received {:settle, _, _, _}
+    assert Enum.count(Memory.claims(ctx.guard)) == 2
+  end
+
   defp wait_until(fun, tries \\ 50) do
     cond do
       fun.() -> :ok

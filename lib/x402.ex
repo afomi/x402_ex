@@ -121,14 +121,37 @@ defmodule X402 do
   Before it succeeds, a facilitator adapter that raises, throws or exits is
   treated as the facilitator being unavailable, and fails closed.
 
+  ## settlement_pending: one retry
+
+  A `/settle` that answers `settlement_pending` has broadcast a transaction
+  and names its hash (spec 9, non-terminal). `handle/2` then calls `/settle`
+  once more, with the same request body, in the same settle task and under
+  the same `"auth:"` claim, as the reference server does. The chain spends
+  an EIP-3009 nonce once, so the second call cannot move the money twice,
+  and the one claim still means one answer per authorization. The retry is
+  given what is left of the first call's settle budget (the adapter's
+  `:settle_timeout`, 15 s by default), never less than 5 s, so settle, retry
+  and the Stripe record fit `:settle_await_ms`.
+
+  Only a success naming the pending hash is served. A success naming
+  another hash is the one answer that could book the wrong transaction, so
+  it is written as a `"tx:"` row keyed on the pending hash with
+  `kind: :transaction_disputed` and `dispute: :pending_hash_changed`, logged
+  as `outcome=pending_hash_changed` with both hashes, and not served. A
+  second `settlement_pending`, or a refusal after the broadcast, is refused
+  as `:settlement_pending` with the hash logged (`reconcile=on_chain`). A
+  retry that times out, crashes or cannot be read fails closed, logged as
+  `outcome=settle_retry_unavailable` with the hash. A pending answer with no
+  well-formed hash is not retried.
+
   ## Failing closed
 
-  Claims are never released. If settlement fails, times out or comes back
-  `settlement_pending`, the authorization stays claimed and the client must
-  sign a new one; the same header is refused as `:replayed`. A timeout during
-  settle may still have moved money: such a case is logged with the payer,
-  and a pending one with the transaction hash, for the app to reconcile
-  (`X402.Reconciler`, "What it does not cover").
+  Claims are never released. If settlement fails, times out or is still
+  `settlement_pending` after the retry, the authorization stays claimed and
+  the client must sign a new one; the same header is refused as `:replayed`.
+  A timeout during settle may still have moved money: such a case is logged
+  with the payer, and a pending one with the transaction hash, for the app
+  to reconcile (`X402.Reconciler`, "What it does not cover").
 
   Results:
 
@@ -169,6 +192,10 @@ defmodule X402 do
   # How long a settle in flight gets to finish when the app shuts down (a
   # deploy): a settle may take 15 s and the Stripe record up to 12 s more.
   @settle_shutdown_ms 30_000
+
+  # The least the one retry of /settle after settlement_pending is given,
+  # whatever is left of the first call's budget.
+  @retry_floor_ms 5_000
 
   @doc false
   def settle_shutdown_ms, do: @settle_shutdown_ms
@@ -403,18 +430,13 @@ defmodule X402 do
   end
 
   defp settle(%{facilitator: {module, config}} = ctx, request, payment, auth_key) do
+    started = System.monotonic_time(:millisecond)
+
     case Safe.call(fn -> module.settle(request, config) end) do
       {:ok, {:ok, %Settlement{} = s}} ->
         case well_formed(ctx, s) do
           {:ok, s} ->
-            case consistent(ctx, s, payment) do
-              :ok ->
-                s = %{s | payer: payment.payer, payment_id: payment.payment_id}
-                record(ctx, s, payment, auth_key)
-
-              {:mismatch, reason} ->
-                dispute(ctx, s, payment, auth_key, reason)
-            end
+            accept(ctx, s, payment, auth_key)
 
           {:malformed, reason} ->
             # Whatever adapter this came from, nothing here can be keyed,
@@ -427,8 +449,7 @@ defmodule X402 do
         refuse(ctx.offer, :settlement_failed, :logged)
 
       {:ok, {:error, {:pending, tx}}} ->
-        Logger.error(log("settlement_pending", payment.payer, code(tx)) <> " reconcile=on_chain")
-        refuse(ctx.offer, :settlement_pending, :logged)
+        retry_pending(ctx, request, payment, auth_key, tx, started)
 
       {:ok, {:error, why}} ->
         settle_unavailable(short(why), payment)
@@ -439,6 +460,117 @@ defmodule X402 do
       {:caught, kind} ->
         settle_unavailable("adapter_#{kind}", payment)
     end
+  end
+
+  # A well-formed settlement: the report must agree with the signed payment,
+  # then the money has moved and the record comes first.
+  defp accept(ctx, s, payment, auth_key) do
+    case consistent(ctx, s, payment) do
+      :ok ->
+        s = %{s | payer: payment.payer, payment_id: payment.payment_id}
+        record(ctx, s, payment, auth_key)
+
+      {:mismatch, reason} ->
+        dispute(ctx, s, payment, auth_key, reason)
+    end
+  end
+
+  # /settle answered settlement_pending with the hash it broadcast (spec 9,
+  # non-terminal). Retry once, with the same request body, in this same task
+  # and under the same "auth:" claim, as the reference server does
+  # (settleWithPendingRetry). The chain spends an EIP-3009 nonce once, so a
+  # second /settle cannot move the money twice, and the one claim means one
+  # answer per authorization however the retry ends. The retry is given what
+  # is left of the first call's settle budget, never less than
+  # @retry_floor_ms, so settle, retry and the Stripe record fit
+  # :settle_await_ms. Only a success naming the pending hash is accepted: a
+  # different hash is the one answer that could book the wrong transaction,
+  # so it is written as a disputed row keyed on the pending hash and served
+  # nothing. A pending answer with no well-formed hash is not retried.
+  defp retry_pending(ctx, request, payment, auth_key, pending, started) do
+    {:ok, scheme} = Scheme.for(ctx.offer.scheme, ctx.offer.network)
+
+    if scheme.valid_transaction?(pending) do
+      retry_pending(ctx, request, payment, auth_key, String.downcase(pending), started, :retry)
+    else
+      Logger.error(log("settlement_pending", payment.payer, nil) <> " reconcile=on_chain")
+      refuse(ctx.offer, :settlement_pending, :logged)
+    end
+  end
+
+  defp retry_pending(
+         %{facilitator: {module, config}} = ctx,
+         request,
+         payment,
+         auth_key,
+         pending,
+         started,
+         :retry
+       ) do
+    retry_config = retry_config(config, started)
+
+    case Safe.call(fn -> module.settle(request, retry_config) end) do
+      {:ok, {:ok, %Settlement{} = s}} ->
+        case well_formed(ctx, s) do
+          {:ok, %Settlement{transaction: ^pending} = s} ->
+            accept(ctx, s, payment, auth_key)
+
+          {:ok, %Settlement{transaction: other} = s} ->
+            Logger.error(
+              log("pending_hash_changed", payment.payer, pending) <>
+                " retry_tx_hash=#{other} reconcile=on_chain"
+            )
+
+            dispute(ctx, %{s | transaction: pending}, payment, auth_key, :pending_hash_changed)
+
+          {:malformed, reason} ->
+            retry_unavailable(Atom.to_string(reason), payment, pending)
+        end
+
+      {:ok, {:error, {:pending, again}}} ->
+        Logger.error(
+          log("settlement_pending", payment.payer, pending) <>
+            " retry=pending retry_tx_hash=#{code(again)} reconcile=on_chain"
+        )
+
+        refuse(ctx.offer, :settlement_pending, :logged)
+
+      {:ok, {:error, {:rejected, why}}} ->
+        # The first call broadcast a transaction; a refusal now does not undo it.
+        Logger.error(
+          log("settlement_pending", payment.payer, pending) <>
+            " retry=rejected reason=#{code(why)} reconcile=on_chain"
+        )
+
+        refuse(ctx.offer, :settlement_pending, :logged)
+
+      {:ok, {:error, why}} ->
+        retry_unavailable(short(why), payment, pending)
+
+      {:ok, _other} ->
+        retry_unavailable("unexpected_return", payment, pending)
+
+      {:caught, kind} ->
+        retry_unavailable("adapter_#{kind}", payment, pending)
+    end
+  end
+
+  # What is left of the settle budget after the first call, floor @retry_floor_ms.
+  defp retry_config(config, started) when is_list(config) do
+    budget = Keyword.get(config, :settle_timeout, Facilitator.HTTP.default_settle_timeout())
+    elapsed = System.monotonic_time(:millisecond) - started
+    Keyword.put(config, :settle_timeout, max(budget - elapsed, @retry_floor_ms))
+  end
+
+  defp retry_config(config, _started), do: config
+
+  defp retry_unavailable(reason, payment, pending) do
+    Logger.error(
+      log("settle_retry_unavailable", payment.payer, pending) <>
+        " reason=#{reason} reconcile=on_chain"
+    )
+
+    {:error, :facilitator_unavailable}
   end
 
   # A settlement is checked here whichever adapter returned it: the hash must

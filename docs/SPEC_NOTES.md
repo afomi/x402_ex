@@ -121,9 +121,10 @@ Response: `SettleResponse` (`SPEC` 5.3.2): `success`, `errorReason`, `payer`, `t
 The reference EVM facilitator does not return `amount`; when one is present we require it to equal the offer's.
 
 `settlement_pending` (`SPEC` 9): "broadcast but its confirmation could not be established"; "**non-terminal**"; carries a non-empty `transaction`.
-We treat it as not settled, keep the payment claimed and log the hash.
-The reference server instead retries `/settle` once with the same payload (`settleWithPendingRetry`, `x402ResourceServer.ts`), and the reference facilitator keeps a store keyed by the signature so the retry reconciles against the hash it already broadcast.
-Our refusal means the client signs a new authorization while the first may still confirm; see the CHANGELOG and the open proposal to retry once.
+The reference server retries `/settle` once with the same payload (`settleWithPendingRetry`, `x402ResourceServer.ts`), and the reference facilitator keeps a store keyed by the signature so the retry reconciles against the hash it already broadcast.
+We do the same from v0.1.2: one retry with the same request body, under the same `"auth:"` claim, given what is left of the settle budget (floor 5 s).
+We go one step further than the reference and serve only a success whose hash equals the pending one; a success naming another hash is written as a disputed row and served nothing, since Stripe would otherwise verify the second hash while the money moved in the first.
+A second `settlement_pending` is refused, the payment stays claimed and the hash is logged.
 
 Non-2xx handling follows the reference client (`typescript/packages/core/src/http/httpFacilitatorClient.ts`): a non-2xx body with `isValid` (or `success`) is raised as a structured `VerifyError` or `SettleError` carrying that body, that is, a verdict; anything else is a plain error.
 The reference follows redirects (`redirect: "follow"`) and waits up to 90 seconds (`DEFAULT_TIMEOUT_MS`); we follow none and wait 5 seconds for `/verify` and 15 for `/settle` by default.

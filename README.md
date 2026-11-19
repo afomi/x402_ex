@@ -78,6 +78,10 @@ The settlement carries on after the request gives up, and its `"tx:"` row and th
 The client's retry with the same header is refused as replayed, so it signs a new payment; it is never charged twice for one authorization.
 A settle in flight also gets 30 seconds to finish when the app shuts down, so a deploy does not cut it short.
 
+A facilitator that answers `settlement_pending` (broadcast, not yet confirmed) is asked once more, with the same request, inside the same settle task and under the same claim, as the reference server does.
+Only a success naming the same hash is served; another hash is written as a disputed row and served nothing.
+The retry gets what is left of the first call's `:settle_timeout`, never under 5 seconds, so the whole thing still fits the settle wait.
+
 ## One deposit address per app
 
 The exactly-once boundary is one app's guard table.
@@ -119,6 +123,7 @@ The library sets no CORS headers; add that one in your CORS plug if browsers wil
 Each app keeps its own claims, in its own database, behind a unique index.
 The index is what makes a claim atomic across concurrent requests and across nodes.
 `X402.ReplayGuard.Memory` is for tests only: it forgets on restart and knows nothing of other nodes.
+It refuses every call with `{:error, :memory_guard_not_allowed}` unless `config :x402_ex, allow_memory_guard: true` is set, which belongs in `config/test.exs` only; `X402.handle/2` then fails closed before any settle.
 
 Migration:
 
@@ -133,7 +138,8 @@ defmodule MyApp.Repo.Migrations.CreateX402Claims do
       # "authorization", "transaction", or "transaction_disputed" (a settle that
       # reported success but contradicted the signed payment; see :dispute).
       add :kind, :text, null: false
-      # On "transaction_disputed" rows: "payer_mismatch" or "amount_mismatch".
+      # On "transaction_disputed" rows: "payer_mismatch", "amount_mismatch" or
+      # "pending_hash_changed" (the retry after settlement_pending named another hash).
       add :dispute, :text
       # The app this claim belongs to (the :scope app name).
       add :app, :text, null: false
@@ -247,17 +253,18 @@ X402.Reconciler.record_unrecorded({MyApp.X402Claims, []}, fn -> stripe_secret_ke
 It is safe to repeat: the idempotency key is the transaction hash, so Stripe returns the same PaymentIntent.
 If a run overlaps a request's own Stripe call for the same hash, Stripe answers the second with a 409 (`idempotency_key_in_use`); that row is reported as failed and the next run finishes it.
 It books only `kind = 'transaction'` rows.
-A `transaction_disputed` row is a settlement whose report contradicted the signed payment: the client was not served, the money may have moved, and it needs a person and a check on chain.
+A `transaction_disputed` row is a settlement whose report contradicted the signed payment, or a retry after `settlement_pending` that named another hash (`dispute = 'pending_hash_changed'`, keyed on the pending hash): the client was not served, the money may have moved, and it needs a person and a check on chain.
 An `"auth:"` row with no `"tx:"` row whose `auth_key` points to it needs a check on chain first (`X402.Reconciler` docs).
 
 ## Configuration
 
 ```elixir
-# config/test.exs, and only there: lets tests pass `req_options: [plug: {Req.Test, MyStub}]`.
-config :x402_ex, allow_req_options: true
+# config/test.exs, and only there: lets tests pass `req_options: [plug: {Req.Test, MyStub}]`
+# and use `X402.ReplayGuard.Memory` as the replay guard.
+config :x402_ex, allow_req_options: true, allow_memory_guard: true
 ```
 
-Outside that setting, any `:req_options` is refused, because a `plug:` could stand in for the facilitator and forge its verdicts.
+Outside those settings, any `:req_options` is refused, because a `plug:` could stand in for the facilitator and forge its verdicts, and `X402.ReplayGuard.Memory` refuses every claim, because it would let a payment be replayed after a restart.
 
 ## Logging
 

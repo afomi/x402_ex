@@ -17,7 +17,9 @@ defmodule X402.ReplayGuard do
 
   `meta` is a map with `:kind` (`:authorization`, `:transaction`, or
   `:transaction_disputed` for a settlement whose report contradicted the
-  signed payment, with `:dispute` naming why), `:app`,
+  signed payment, with `:dispute` naming why: `:payer_mismatch`,
+  `:amount_mismatch`, or `:pending_hash_changed` when the retry after
+  `settlement_pending` named another hash), `:app`,
   `:network`, `:asset`, `:pay_to`, `:payer`, `:amount`, `:resource`, and
   for `:transaction` also `:tx_hash` and `:auth_key` (the `"auth:"` key it
   settled). Claims are never released: a payment whose settlement failed
