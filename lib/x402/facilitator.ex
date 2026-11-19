@@ -21,7 +21,10 @@ defmodule X402.Facilitator do
       (`isValid: false` or `success: false`, on a 2xx or not). `reason` is the
       facilitator's reason code if it looks like one, else `"unknown"`.
     * `{:error, {:pending, tx_hash}}`: settle returned `settlement_pending`
-      (spec 9): broadcast, not confirmed. Not a success.
+      (spec 9): broadcast, not confirmed. Not a success. `X402.handle/2`
+      calls `settle/2` once more with the same request and a config whose
+      `:settle_timeout` is what is left of the first call's budget (floor
+      5 s); an adapter with its own timeout should honour that key.
     * `{:error, reason}`: anything else, where `reason` is one of `:timeout`,
       `:unavailable`, `{:http_status, status}`, `:invalid_response`,
       `:invalid_config`, `:req_options_not_allowed` or `:not_implemented`.
