@@ -3,7 +3,7 @@
 This project follows [Semantic Versioning](https://semver.org).
 Before 1.0, a minor version may change the API; each change is listed here.
 
-## Unreleased
+## v0.1.2 (2026-11-19)
 
 - `X402.handle/2` retries `/settle` once after `settlement_pending`, with the same request body, inside the same settle task and under the same `"auth:"` claim, as the reference server does; the chain spends an EIP-3009 nonce once, so the money cannot move twice.
   The retry gets what is left of the first call's `:settle_timeout` (floor 5 s), so settle, retry and the Stripe record fit `:settle_await_ms`.
