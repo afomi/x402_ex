@@ -21,6 +21,14 @@ Short names used below:
 - `SAMPLE_TS` = https://github.com/stripe-samples/machine-payments/blob/e535a061b6fb7184d2167884a91777cf6a65cb41/x402/server/node-typescript/main.ts
 - `SAMPLE_PY` = https://github.com/stripe-samples/machine-payments/blob/e535a061b6fb7184d2167884a91777cf6a65cb41/x402/server/python/main.py
 - `STRIPE_X402` = https://docs.stripe.com/payments/machine/x402
+- `CDP_GO` = https://github.com/coinbase/cdp-sdk/blob/4515c7fc74fb7e7060c844bb49ee1e6616b494b0/go/auth/jwt.go
+- `CDP_TS` = https://github.com/coinbase/cdp-sdk/blob/4515c7fc74fb7e7060c844bb49ee1e6616b494b0/typescript/packages/cdp-sdk/src/auth/utils/jwt.ts
+- `CDP_PY` = https://github.com/coinbase/cdp-sdk/blob/4515c7fc74fb7e7060c844bb49ee1e6616b494b0/python/cdp/auth/utils/jwt.py
+- `CDP_AUTH` = https://docs.cdp.coinbase.com/api-reference/v2/authentication
+- `CDP_VERIFY` = https://docs.cdp.coinbase.com/api-reference/v2/rest-api/x402-facilitator/verify-payment
+- `CDP_SETTLE` = https://docs.cdp.coinbase.com/api-reference/v2/rest-api/x402-facilitator/settle-payment
+
+The CDP auth notes were read on 2026-11-23: `coinbase/cdp-sdk` at `4515c7fc74fb7e7060c844bb49ee1e6616b494b0` (`main`), `coinbase/x402` still at `0e6e8c55d86b4f14234fb6e49a4052074fb93e57`, and the CDP docs as served that day.
 
 ## Headers
 
@@ -133,9 +141,29 @@ The reference follows redirects (`redirect: "follow"`) and waits up to 90 second
 
 - x402.org: `https://x402.org/facilitator`, the reference `DEFAULT_FACILITATOR_URL` (`httpFacilitatorClient.ts`), named by `STRIPE_X402` "Test in a Stripe sandbox" for Base Sepolia.
 - CDP: `https://api.cdp.coinbase.com/platform/v2/x402` (`go/legacy/pkg/coinbasefacilitator/facilitator.go`, `CoinbaseFacilitatorBaseURL` + `CoinbaseFacilitatorV2Route`; `SAMPLE_PY`, `CDP_FACILITATOR_URL`).
-  Auth is `Authorization: Bearer <JWT>` per request, minted by the CDP SDK from the key id and secret for `POST api.cdp.coinbase.com/platform/v2/x402/verify` (or `/settle`) (`go/legacy/pkg/coinbasefacilitator/cdp.go`, `auth.GenerateJWT`; `SAMPLE_PY`, `cdp.auth.get_auth_headers`).
-  The Go client also sends a `Correlation-Context` header.
-  **UNCONFIRMED / NOT IMPLEMENTED:** the JWT's claims, algorithm and key format; v0.1 returns `{:error, :not_implemented}` unless the app passes an `:auth_headers` function. We send no `Correlation-Context`.
+  `CDP_VERIFY` and `CDP_SETTLE` confirm `POST https://api.cdp.coinbase.com/platform/v2/x402/verify` and `/settle`, server `https://api.cdp.coinbase.com/platform`, a body of `x402Version`, `paymentPayload` and `paymentRequirements`, and the security scheme `apiKeyAuth`, which `CDP_AUTH` defines as `Authorization: Bearer <JWT>`.
+
+### CDP auth
+
+The x402 reference's CDP client (`go/legacy/pkg/coinbasefacilitator/cdp.go`, `CreateAuthHeader`) calls `auth.GenerateJWT` from `CDP_GO` with method `POST`, host `api.cdp.coinbase.com` (the base URL with `https://` trimmed) and path `/platform/v2/x402/verify` or `/settle`, and sends `"Bearer " <> jwt`; `facilitator.go`, `CreateCdpAuthHeaders`, mints one for each path on each call.
+We follow `CDP_GO`'s `GenerateJWT`, which `CDP_TS`'s `generateJwt` matches claim for claim:
+
+- Protected header: `alg` (`ES256` or `EdDSA`), `kid` (the key id), `typ` `"JWT"`, `nonce` (16 random bytes, lowercase hex; `CDP_GO` `hex.EncodeToString`, `CDP_TS` `nonce()`).
+- Claims: `sub` the key id, `iss` `"cdp"`, `nbf` and `iat` now, `exp` now plus 120 seconds (both SDKs' default `expiresIn`), and `uris` a one-element array, `"<METHOD> <host><path>"` with one space (`fmt.Sprintf("%s %s%s", …)`; `CDP_TS` the same template).
+  `aud` is sent only when the caller passes one; the x402 client passes none, so we send none.
+- We write keys in the order Go's `encoding/json` writes a map, sorted, so for an Ed25519 key, a clock and a nonce our token is the bytes `CDP_GO` would produce.
+- Ed25519 secret: standard base64 of 64 bytes, seed then public key (`CDP_GO` `isValidEd25519Key`, `ed25519.PrivateKey(decoded)`; `CDP_TS` builds a JWK from `d` = the first 32 bytes and `x` = the last 32).
+  We also check the public half against the seed; `CDP_GO` would sign with a mismatched half and produce a token no one can verify.
+- EC secret: a PEM `EC PRIVATE KEY` (SEC1; `CDP_GO` `x509.ParseECPrivateKey`), and we also take PKCS #8 `PRIVATE KEY` (`CDP_TS` `importPKCS8`); P-256 only. The JWS signature is `r || s`, 64 bytes (RFC 7518 section 3.4).
+- `CDP_PY` replaces a literal `\n` in the secret with a newline before parsing; so do we.
+  `CDP_PY` differs from the other two in two ways we do not follow: it sends no `iat`, and its nonce is 16 decimal digits.
+- `CDP_AUTH`'s hand-written examples (Ruby and others, "Generate Bearer Token") differ again: they send `aud: ["cdp_service"]` and a singular `uri` string instead of `uris`.
+  We follow the SDKs, which the x402 reference uses; **UNCONFIRMED** which forms CDP's server accepts, until a live call.
+- `CDP_AUTH`: "Bearer Tokens are valid for 2 minutes by default."
+- The x402 Go client also sends a `Correlation-Context` header (`CreateCorrelationHeader`: SDK name, language and version). We send none; it is not part of auth.
+- **UNCONFIRMED:** whether CDP rejects a reused `nonce` within the token's life, and how much clock skew it allows on `nbf` and `exp`. Neither is documented.
+- No published test vector: `CDP_GO`'s `jwt_test.go` and `CDP_TS`'s `jwt.test.ts` generate their keys at run time.
+  Our tests use RFC 8037 appendix A (Ed25519) and RFC 7515 appendix A.3 (ES256) as published vectors for the signing primitives.
 
 ## Stripe
 

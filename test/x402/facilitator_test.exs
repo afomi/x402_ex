@@ -197,13 +197,15 @@ defmodule X402.FacilitatorTest do
   end
 
   describe "CDP" do
-    test "with only a key id and secret, sends nothing and is not implemented",
+    test "a key secret in neither CDP format sends nothing and is invalid config",
          %{request: request, config: config} do
       stub(fn _ -> flunk("no request should be sent") end)
       config = config ++ [key_id: "id", key_secret: fn -> "secret" end]
 
-      assert CDP.verify(request, config) == {:error, :not_implemented}
-      assert CDP.settle(request, config) == {:error, :not_implemented}
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert CDP.verify(request, config) == {:error, :invalid_config}
+        assert CDP.settle(request, config) == {:error, :invalid_config}
+      end)
     end
 
     test "a secret given as a bare string is refused", %{request: request, config: config} do

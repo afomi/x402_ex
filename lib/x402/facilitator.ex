@@ -27,7 +27,8 @@ defmodule X402.Facilitator do
       5 s); an adapter with its own timeout should honour that key.
     * `{:error, reason}`: anything else, where `reason` is one of `:timeout`,
       `:unavailable`, `{:http_status, status}`, `:invalid_response`,
-      `:invalid_config`, `:req_options_not_allowed` or `:not_implemented`.
+      `:invalid_config`, `:req_options_not_allowed` or `:not_implemented`
+      (kept in the type for older adapters; none in this library returns it).
 
   An adapter should return, not raise; `X402.handle/2` still catches a raise,
   throw or exit from either call and fails closed.
