@@ -851,6 +851,46 @@ defmodule X402.HandleTest do
     refute Exception.message(error) =~ "s3cret"
   end
 
+  test "with the CDP facilitator, verify and settle each carry a signed JWT for their path",
+       ctx do
+    test = self()
+    {public, seed} = :crypto.generate_key(:eddsa, :ed25519)
+    secret = Base.encode64(seed <> public)
+
+    stub(fn conn ->
+      [<<"Bearer ", token::binary>>] = Plug.Conn.get_req_header(conn, "authorization")
+      [h, c, sig] = String.split(token, ".")
+      sig = Base.url_decode64!(sig, padding: false)
+      claims = Jason.decode!(Base.url_decode64!(c, padding: false))
+      ok? = :crypto.verify(:eddsa, :none, h <> "." <> c, sig, [public, :ed25519])
+      send(test, {:cdp, conn.host, conn.request_path, ok?, claims["uris"]})
+
+      case conn.request_path do
+        "/platform/v2/x402/verify" -> Req.Test.json(conn, Fixtures.verify_ok())
+        "/platform/v2/x402/settle" -> Req.Test.json(conn, Fixtures.settle_ok())
+      end
+    end)
+
+    cdp =
+      {X402.Facilitator.CDP,
+       key_id: "test-key-id",
+       key_secret: fn -> secret end,
+       req_options: [plug: {Req.Test, __MODULE__}]}
+
+    {result, log} =
+      with_log(fn -> X402.handle(conn(ctx.header), Keyword.put(ctx.opts, :facilitator, cdp)) end)
+
+    assert {:ok, _conn, %Settlement{}} = result
+
+    for op <- ["verify", "settle"] do
+      path = "/platform/v2/x402/" <> op
+      uri = "POST api.cdp.coinbase.com" <> path
+      assert_received {:cdp, "api.cdp.coinbase.com", ^path, true, [^uri]}
+    end
+
+    refute log =~ secret
+  end
+
   ## One retry of /settle after settlement_pending.
 
   defmodule ConfigFacilitator do

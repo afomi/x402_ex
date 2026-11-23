@@ -3,6 +3,20 @@
 This project follows [Semantic Versioning](https://semver.org).
 Before 1.0, a minor version may change the API; each change is listed here.
 
+## Unreleased
+
+- `X402.Facilitator.CDP` signs its own requests, so Base mainnet payments go through Coinbase Developer Platform's facilitator.
+  Before, it failed closed with `{:error, :not_implemented}` unless the app minted the token itself.
+  Each `/verify` and `/settle` call carries `Authorization: Bearer <JWT>`, a new token per request, built as CDP's SDK builds it (`coinbase/cdp-sdk` `go/auth/jwt.go`, `GenerateJWT`, which the x402 reference's CDP client calls): header `alg`, `kid`, `nonce` (16 random bytes, hex) and `typ`; claims `sub` the key id (the header's `kid` too), `iss` `"cdp"`, `iat` and `nbf` now, `exp` now plus 120 seconds, and `uris` `["POST api.cdp.coinbase.com/platform/v2/x402/<verify|settle>"]`.
+- Configure it with `key_id:` (a string or a 0-arity function) and `key_secret:` (a 0-arity function only), read on every call.
+  `X402.Facilitator.CDP.JWT` reads both CDP key formats: Ed25519 (base64 of seed and public key, `EdDSA`), with the public half checked against the seed, and ECDSA P-256 PEM, SEC1 or PKCS #8 (`ES256`); a literal `\n` in the secret reads as a newline.
+- A missing, unreadable or unrecognised key is now `{:error, :invalid_config}`, sent nothing, with a warning naming the reason as an atom, never the key; so is a key given alongside `:auth_headers`.
+  `:not_implemented` stays in the `X402.Facilitator` error type, but no adapter returns it.
+- The parsed key holds the private key only inside a signing closure, so neither `inspect/1` nor a raw crash report prints it.
+- Tests check the token's exact bytes against a fixed key and clock, round-trip generated keys of each format, sign RFC 8037's Ed25519 vector exactly and read RFC 7515's ES256 vector, and show no secret or token in logs or `inspect`.
+  Coinbase publishes no fixed JWT vector: its SDK tests generate keys at run time.
+  No test calls CDP.
+
 ## v0.1.2 (2026-11-19)
 
 - `X402.handle/2` retries `/settle` once after `settlement_pending`, with the same request body, inside the same settle task and under the same `"auth:"` claim, as the reference server does; the chain spends an EIP-3009 nonce once, so the money cannot move twice.

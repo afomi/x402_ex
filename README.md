@@ -12,7 +12,7 @@ Every header and field is sourced in [docs/SPEC_NOTES.md](docs/SPEC_NOTES.md); w
 
 v0.1 is ready for sandbox use: Base Sepolia, the x402.org test facilitator and a Stripe sandbox.
 It has not yet carried a live payment.
-Coinbase Developer Platform authentication, needed for mainnet, is not implemented and fails closed.
+Coinbase Developer Platform authentication, needed for mainnet, is listed under "Unreleased" in the changelog: it waits on a security review before it is tagged.
 The API may change before 1.0, as [CHANGELOG.md](CHANGELOG.md) records.
 
 ## Installation
@@ -66,10 +66,33 @@ end
 On a network whose USDC the library knows (Base, Base Sepolia), an offer must use that USDC's contract and EIP-712 domain; `allow_unknown_asset: true` opts out.
 `X402.Stripe` refuses a live key with Base Sepolia and a test key with Base mainnet, so faucet USDC never shows up as live revenue.
 
-On Base mainnet, use `{X402.Facilitator.CDP, key_id: id, key_secret: fn -> secret() end}`.
-Its JWT auth is not built in v0.1 (see the module docs), so on its own it fails closed with `{:error, :not_implemented}`.
+## Base mainnet: the CDP facilitator
 
-Pass secrets (the Stripe key, the CDP secret) as 0-arity functions, so they never sit in an argument or keyword list that a crash report could print.
+On Base mainnet (`eip155:8453`), payments go through Coinbase Developer Platform's facilitator, which takes a signed JWT on every request.
+Create a Secret API Key in the CDP portal (Ed25519, the default, or ECDSA), keep its id and secret in your secret store, and pass both as functions:
+
+```elixir
+{:ok, usdc} = X402.Scheme.ExactEvm.usdc("eip155:8453")
+
+X402.handle(conn,
+  offer: offer,  # network: "eip155:8453", asset: usdc.asset, extra: usdc.extra
+  scope: [app: "my-app", pay_to: deposit_address],
+  facilitator:
+    {X402.Facilitator.CDP,
+     key_id: fn -> System.fetch_env!("CDP_API_KEY_ID") end,
+     key_secret: fn -> System.fetch_env!("CDP_API_KEY_SECRET") end},
+  replay_guard: {MyApp.X402Claims, []},
+  on_settled: &X402.Stripe.record(fn -> stripe_live_secret_key() end, &1)
+)
+```
+
+Each call to `/verify` and `/settle` gets its own token, signed with the key and bound to that one request (`"POST api.cdp.coinbase.com/platform/v2/x402/verify"`), lasting 120 seconds, as CDP's SDK builds it (`X402.Facilitator.CDP.JWT`).
+The secret is read on each call and never stored, logged or printed; a secret given as a plain string is refused.
+The URL is fixed, so a token can only go to `api.cdp.coinbase.com`.
+A missing or unreadable key fails closed with `{:error, :invalid_config}` before any request, and a warning names the reason, never the key.
+The token's `nbf` is the server's clock, so keep it synchronised (NTP): a clock running ahead of CDP's is refused.
+
+Pass secrets (the Stripe key, the CDP key secret) as 0-arity functions, so they never sit in an argument or keyword list that a crash report could print.
 
 `X402.handle/2`'s module docs explain the order of the steps, why the payment is claimed before it is settled, and what happens after the money moves.
 
@@ -110,7 +133,7 @@ The library sets no CORS headers; add that one in your CORS plug if browsers wil
 - `X402.Offer`: an offer and its `PAYMENT-REQUIRED` header.
 - `X402.Payment`: decodes the client's `PAYMENT-SIGNATURE` header and matches it to an offer.
 - `X402.Scheme`: picks the rules for a scheme on a network; `X402.Scheme.ExactEvm` is the one in v0.1.
-- `X402.Facilitator`: the verify and settle behaviour; `X402.Facilitator.X402Org` and `X402.Facilitator.CDP` adapters over `X402.Facilitator.HTTP`.
+- `X402.Facilitator`: the verify and settle behaviour; `X402.Facilitator.X402Org` and `X402.Facilitator.CDP` adapters over `X402.Facilitator.HTTP`; `X402.Facilitator.CDP.JWT` signs CDP's per-request token.
 - `X402.Settlement`: a checked settlement and its `PAYMENT-RESPONSE` header.
 - `X402.ReplayGuard`: the claim and record behaviour; `X402.ReplayGuard.Memory` for tests.
 - `X402.Stripe`: records a settlement as a Stripe PaymentIntent.
@@ -269,7 +292,7 @@ Outside those settings, any `:req_options` is refused, because a `plug:` could s
 ## Logging
 
 The library logs the outcome, the payer address and the transaction hash.
-It never logs a payment header, a signature or a key, and `X402.Payment` does not show the signed authorization when inspected.
+It never logs a payment header, a signature, a key or a CDP token, and `X402.Payment` does not show the signed authorization when inspected.
 Refusals of malformed headers log at debug level.
 
 ## Tests
